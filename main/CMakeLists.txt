@@ -86,3 +86,10 @@ idf_component_register(SRCS "main.cpp" "${SOURCE_FILES}"
                        INCLUDE_DIRS "${include_dirs}")
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -std=gnu++17)
+
+# Workaround: GCC Xtensa ICE (internal compiler error / segfault) during
+# register allocation on pack.cc with -O2/-Os. Compile with -O0 instead.
+set_source_files_properties(
+    ../edge-impulse-sdk/tensorflow/lite/micro/kernels/pack.cc
+    PROPERTIES COMPILE_OPTIONS "-O0"
+)
