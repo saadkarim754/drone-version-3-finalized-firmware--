@@ -1,44 +1,50 @@
-/* The Clear BSD License
+/* ==========================================================================
+ * ESP32-CAM Drone Fire Detection + Pixhawk Companion Computer
  *
- * Copyright (c) 2025 EdgeImpulse Inc.
- * All rights reserved.
+ * Merged firmware combining:
+ *   1. Edge Impulse FOMO fire detection with live camera feed
+ *   2. MAVLink companion computer for Pixhawk drone control
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted (subject to the limitations in the disclaimer
- * below) provided that the following conditions are met:
+ * Features:
+ *   - Live camera feed with AI fire detection bounding box overlay
+ *   - MAVLink v2 communication with Pixhawk autopilot
+ *   - Unified web dashboard: camera + drone controls + telemetry
+ *   - Arm / Disarm / Force-Arm / Flight mode selection
+ *   - RC channel override (Throttle, Yaw, Pitch, Roll sliders)
+ *   - Automated takeoff sequence (GUIDED > ARM > Takeoff > Hover > LAND)
+ *   - GPS, Barometer, Battery, Attitude, VFR HUD telemetry
+ *   - Geofence safety (altitude + radius)
  *
- *   * Redistributions of source code must retain the above copyright notice,
- *   this list of conditions and the following disclaimer.
+ * Hardware:
+ *   - ESP32-CAM (AI-Thinker or similar) with OV2640 camera
+ *   - Pixhawk flight controller connected via UART
  *
- *   * Redistributions in binary form must reproduce the above copyright
- *   notice, this list of conditions and the following disclaimer in the
- *   documentation and/or other materials provided with the distribution.
+ * GPIO Assignment (adjust for your board):
+ *   - GPIO 13 (TX) -> Pixhawk RX   (MAVLink UART)
+ *   - GPIO 14 (RX) <- Pixhawk TX   (MAVLink UART)
+ *   - GPIO 33      -> Onboard red LED (heartbeat / fire indicator)
+ *   - Camera pins  -> Managed by esp32-camera driver
  *
- *   * Neither the name of the copyright holder nor the names of its
- *   contributors may be used to endorse or promote products derived from this
- *   software without specific prior written permission.
+ * Configuration:
+ *   - WiFi AP SSID: DroneFireDetect  Password: drone12345
+ *   - Web interface: http://192.168.4.1
+ *   - MAVLink UART: 57600 baud, 8N1
+ *   - Companion System ID: 200 (avoids Pixhawk sysid=1 conflict)
  *
- * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
- * THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
- * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
- * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
- * IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
+ * License: BSD-3-Clause-Clear (Edge Impulse SDK)
+ * ========================================================================== */
 
-/* Include ----------------------------------------------------------------- */
+/* ========================== INCLUDES ====================================== */
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "sdkconfig.h"
 #include "esp_idf_version.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -54,36 +60,81 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 
+/* Edge Impulse headers */
 #include "ei_device_espressif_esp32.h"
-
 #include "ei_at_handlers.h"
 #include "ei_classifier_porting.h"
 #include "ei_run_impulse.h"
-
 #include "ei_analogsensor.h"
 #include "ei_inertial_sensor.h"
 
-#define RED_LED_PIN GPIO_NUM_21
-#define WHITE_LED_PIN GPIO_NUM_22
-#define BUZZER_PIN GPIO_NUM_13
-#define ACK_BUTTON_PIN GPIO_NUM_14
+/* MAVLink library (lightweight, header-only) */
+#include "mavespstm.h"
 
-#define WIFI_SSID "ESP32-FireDetect"
-#define WIFI_PASS "fire12345"
-#define WIFI_CHANNEL 1
-#define MAX_CONNECTIONS 4
+/* ========================== CONFIGURATION ================================= */
 
-static const char *TAG = "FireDetect";
+/* --- WiFi AP --- */
+#define WIFI_SSID           "DroneFireDetect"
+#define WIFI_PASS           "drone12345"
+#define WIFI_CHANNEL        1
+#define MAX_CONNECTIONS     4
+
+/* --- MAVLink UART to Pixhawk --- */
+#define MAV_UART_NUM        UART_NUM_2
+#define MAV_TX_PIN          GPIO_NUM_13
+#define MAV_RX_PIN          GPIO_NUM_14
+#define MAV_BAUD_RATE       57600
+#define UART_BUF_SIZE       1024
+
+/* --- MAVLink IDs --- */
+#define COMPANION_SYSID     200
+#define COMPANION_COMPID    MAV_COMP_ID_ONBOARD_COMPUTER
+#define PIXHAWK_SYSID       1
+#define PIXHAWK_COMPID      1
+
+/* --- Indicator LED (AI-Thinker onboard red LED, active LOW) --- */
+#define INDICATOR_LED_PIN   GPIO_NUM_33
+
+/* --- Logging --- */
+#define LOG_BUFFER_SIZE     32
+#define LOG_MSG_SIZE        120
+
+/* --- RC Override Safety --- */
+#define RC_OVERRIDE_TIMEOUT_MS 2000
+
+/* --- Auto-flight --- */
+#define SEQ_TAKEOFF_TIMEOUT_MS  30000
+#define SEQ_ALT_TOLERANCE       1.0f
+#define SEQ_ARM_TIMEOUT_MS      15000
+#define FENCE_ALT_MAX           10.0f
+#define FENCE_RADIUS            30.0f
+#define MAV_CMD_NAV_TAKEOFF     22
+
+static const char *TAG = "DroneFire";
+
+/* ========================== FORWARD DECLARATIONS ========================== */
 
 EiDeviceInfo *EiDevInfo = dynamic_cast<EiDeviceInfo *>(EiDeviceESP32::get_device());
 static ATServer *at;
+static EiDeviceESP32 *dev = NULL;
+static httpd_handle_t http_server = NULL;
 
-/* Private variables ------------------------------------------------------- */
-static EiDeviceESP32* dev = NULL;
-static httpd_handle_t server = NULL;
+/* FreeRTOS tasks */
+void serial_task(void *pvParameters);
+void led_task(void *pvParameters);
+void webserver_task(void *pvParameters);
+void inference_task(void *pvParameters);
+static void mavlink_rx_task(void *pvParameters);
+static void mavlink_heartbeat_task(void *pvParameters);
+
+/* ========================== GLOBAL STATE ================================== */
+
+/* --- Mutexes --- */
 static SemaphoreHandle_t detection_mutex = NULL;
+static SemaphoreHandle_t uart_mutex = NULL;
+static SemaphoreHandle_t log_mutex = NULL;
 
-/* Shared detection data */
+/* --- Fire Detection Data (shared with Edge Impulse inference) --- */
 typedef struct {
     uint32_t x;
     uint32_t y;
@@ -95,75 +146,532 @@ typedef struct {
 } detection_data_t;
 
 static detection_data_t latest_detection = {0};
-static char log_buffer[4096] = {0};
-static size_t log_index = 0;
-
-/* Alarm state */
 static bool alarm_active = false;
-static bool alarm_acknowledged = false;
 
-/* Detection mode: 0 = Forest, 1 = Drone */
-static int detection_mode = 0;
-
-/* Camera settings */
+/* --- Camera settings --- */
 static bool camera_vflip = false;
 static bool camera_hflip = false;
 
-/* Drone mode buzzer auto-stop */
-static uint32_t drone_buzzer_start_time = 0;
-static bool drone_buzzer_running = false;
-#define DRONE_BUZZER_DURATION_MS 15000
+/* --- MAVLink parser state --- */
+static mavlink_status_t mav_status;
+static mavlink_message_t mav_msg;
+static uint8_t tx_seq = 0;
 
-/* Button interrupt */
-static volatile bool button_pressed = false;
-static volatile uint32_t last_button_press_time = 0;
+/* --- Attitude data --- */
+static float current_roll = 0.0f;
+static float current_pitch = 0.0f;
+static float current_yaw = 0.0f;
 
-/* Button ISR Handler */
-static void IRAM_ATTR button_isr_handler(void* arg)
-{
-    uint32_t now = xTaskGetTickCountFromISR();
-    /* Debounce: ignore if pressed within last 200ms */
-    if ((now - last_button_press_time) > pdMS_TO_TICKS(200)) {
-        last_button_press_time = now;
-        button_pressed = true;
+/* --- Flight state --- */
+static uint32_t heartbeat_count = 0;
+static uint8_t pixhawk_base_mode = 0;
+static uint32_t pixhawk_custom_mode = 0;
+static uint8_t pixhawk_system_status = 0;
+static bool is_armed = false;
+static bool is_connected = false;
+static uint32_t last_heartbeat_time = 0;
+
+/* --- GPS data --- */
+static int32_t gps_lat = 0;
+static int32_t gps_lon = 0;
+static int32_t gps_alt = 0;
+static uint8_t gps_fix_type = 0;
+static uint8_t gps_satellites = 0;
+static uint16_t gps_eph = 9999;
+static bool gps_has_data = false;
+
+/* --- Global position (fused) --- */
+static int32_t global_rel_alt = 0;
+
+/* --- Barometer data --- */
+static float baro_press_abs = 0.0f;
+static int16_t baro_temperature = 0;
+static bool baro_has_data = false;
+
+/* --- Battery data --- */
+static uint16_t batt_voltage = 0;
+static int16_t batt_current = -1;
+static int8_t batt_remaining = -1;
+static bool batt_has_data = false;
+
+/* --- VFR HUD data --- */
+static float vfr_groundspeed = 0.0f;
+static float vfr_alt = 0.0f;
+static float vfr_climb = 0.0f;
+static int16_t vfr_heading = 0;
+static uint16_t vfr_throttle = 0;
+static bool vfr_has_data = false;
+
+/* --- RC Override state --- */
+static uint16_t rc_chan1 = 0;
+static uint16_t rc_chan2 = 0;
+static uint16_t rc_chan3 = 0;
+static uint16_t rc_chan4 = 0;
+static bool rc_override_active = false;
+static uint32_t rc_last_web_time = 0;
+
+/* --- Auto-flight sequence --- */
+typedef enum {
+    SEQ_IDLE = 0,
+    SEQ_PREFLIGHT,
+    SEQ_ARMING,
+    SEQ_TAKEOFF,
+    SEQ_HOVERING,
+    SEQ_LANDING,
+    SEQ_COMPLETE,
+    SEQ_ABORTED
+} auto_seq_state_t;
+
+static auto_seq_state_t seq_state = SEQ_IDLE;
+static uint32_t seq_timer = 0;
+static uint32_t seq_phase_start = 0;
+static float seq_target_alt = 5.0f;
+static int seq_hover_seconds = 10;
+static int seq_hover_remaining = 0;
+static bool seq_abort_flag = false;
+static uint32_t seq_last_tkoff_send = 0;
+
+/* --- Circular Log Buffer --- */
+static char log_entries[LOG_BUFFER_SIZE][LOG_MSG_SIZE];
+static int log_head = 0;
+static int log_count = 0;
+
+/* ========================== FLIGHT MODE TABLE ============================= */
+
+typedef struct {
+    uint32_t mode_num;
+    const char *name;
+} flight_mode_t;
+
+static const flight_mode_t copter_modes[] = {
+    {0, "STABILIZE"}, {1, "ACRO"},      {2, "ALT_HOLD"}, {3, "AUTO"},
+    {4, "GUIDED"},    {5, "LOITER"},    {6, "RTL"},      {7, "CIRCLE"},
+    {9, "LAND"},      {16, "POSHOLD"},  {17, "BRAKE"},   {21, "SMART_RTL"},
+};
+#define NUM_COPTER_MODES (sizeof(copter_modes) / sizeof(copter_modes[0]))
+
+static const char *get_mode_name(uint32_t mode) {
+    for (int i = 0; i < (int)NUM_COPTER_MODES; i++) {
+        if (copter_modes[i].mode_num == mode) return copter_modes[i].name;
+    }
+    return "UNKNOWN";
+}
+
+static const char *get_status_name(uint8_t status) {
+    switch (status) {
+        case 0: return "UNINIT";    case 1: return "BOOT";
+        case 2: return "CALIBRATING"; case 3: return "STANDBY";
+        case 4: return "ACTIVE";    case 5: return "CRITICAL";
+        case 6: return "EMERGENCY"; default: return "UNKNOWN";
     }
 }
 
-/* FreeRTOS Task Declarations ---------------------------------------------- */
-void serial_task(void *pvParameters);
-void led_task(void *pvParameters);
-void webserver_task(void *pvParameters);
-void inference_task(void *pvParameters);
+static const char *seq_state_name(auto_seq_state_t s) {
+    switch (s) {
+        case SEQ_IDLE: return "IDLE";         case SEQ_PREFLIGHT: return "PREFLIGHT";
+        case SEQ_ARMING: return "ARMING";     case SEQ_TAKEOFF: return "TAKEOFF";
+        case SEQ_HOVERING: return "HOVERING"; case SEQ_LANDING: return "LANDING";
+        case SEQ_COMPLETE: return "COMPLETE";  case SEQ_ABORTED: return "ABORTED";
+        default: return "UNKNOWN";
+    }
+}
 
-/* Helper functions -------------------------------------------------------- */
+/* ========================== LOGGING ======================================= */
 
-void add_log(const char* message) {
-    if (xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(50))) {
-        size_t msg_len = strlen(message);
-        if (log_index + msg_len + 2 < sizeof(log_buffer)) {
-            strcpy(&log_buffer[log_index], message);
-            log_index += msg_len;
-            log_buffer[log_index++] = '\n';
-            log_buffer[log_index] = '\0';
-        } else {
-            // Buffer full, reset
-            log_index = 0;
-            log_buffer[0] = '\0';
+void add_log(const char *fmt, ...) {
+    if (!log_mutex) return;
+    if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(log_entries[log_head], LOG_MSG_SIZE, fmt, args);
+        va_end(args);
+        log_head = (log_head + 1) % LOG_BUFFER_SIZE;
+        if (log_count < LOG_BUFFER_SIZE) log_count++;
+        xSemaphoreGive(log_mutex);
+    }
+}
+
+/* ========================== MAVLINK UART ================================== */
+
+static void mav_uart_init(void) {
+    uart_config_t uart_config = {};
+    uart_config.baud_rate = MAV_BAUD_RATE;
+    uart_config.data_bits = UART_DATA_8_BITS;
+    uart_config.parity = UART_PARITY_DISABLE;
+    uart_config.stop_bits = UART_STOP_BITS_1;
+    uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    uart_config.source_clk = UART_SCLK_DEFAULT;
+
+    ESP_ERROR_CHECK(uart_driver_install(MAV_UART_NUM, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(MAV_UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(MAV_UART_NUM, MAV_TX_PIN, MAV_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    ESP_LOGI(TAG, "MAVLink UART: TX=%d RX=%d Baud=%d", MAV_TX_PIN, MAV_RX_PIN, MAV_BAUD_RATE);
+}
+
+/**
+ * Send MAVLink message with CRC recomputed AFTER setting sequence number.
+ * This avoids the silent-drop bug where Pixhawk rejects mis-CRC'd packets.
+ */
+static void send_mavlink_message(uint8_t *buf, uint16_t len) {
+    if (xSemaphoreTake(uart_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        buf[4] = tx_seq++;
+
+        uint8_t payload_len = buf[1];
+        uint32_t msgid = buf[7] | ((uint32_t)buf[8] << 8) | ((uint32_t)buf[9] << 16);
+
+        uint16_t crc;
+        crc_init(&crc);
+        for (int i = 1; i < 10 + payload_len; i++) {
+            crc_accumulate(buf[i], &crc);
         }
-        xSemaphoreGive(detection_mutex);
+        crc_accumulate(mavlink_get_crc_extra(msgid), &crc);
+
+        buf[10 + payload_len] = crc & 0xFF;
+        buf[10 + payload_len + 1] = (crc >> 8) & 0xFF;
+
+        uart_write_bytes(MAV_UART_NUM, buf, len);
+        xSemaphoreGive(uart_mutex);
     }
-    // If mutex not available, silently skip - don't block
 }
 
-/* Update detection data from inference results */
-void update_detection_data(uint32_t x, uint32_t y, uint32_t width, uint32_t height, float confidence, const char* label) {
-    /* Debug: Always print when this function is called */
-    ei_printf("[WiFi Update] Sending data: %s (%.2f) at (%u,%u) size=%ux%u\r\n",
-              label, confidence, (unsigned int)x, (unsigned int)y, 
-              (unsigned int)width, (unsigned int)height);
-    
-    bool trigger_alarm_log = false;
-    
+/* ========================== MAVLINK COMMANDS =============================== */
+
+static void send_heartbeat(void) {
+    uint8_t buf[32];
+    uint16_t len = mavlink_msg_heartbeat_pack(
+        COMPANION_SYSID, COMPANION_COMPID, buf,
+        MAV_TYPE_GCS, MAV_AUTOPILOT_GENERIC,
+        0, 0, MAV_STATE_ACTIVE);
+    send_mavlink_message(buf, len);
+}
+
+static void send_arm_command(bool arm, bool force) {
+    uint8_t buf[48];
+    float arm_param = arm ? 1.0f : 0.0f;
+    float force_param = force ? (float)MAV_ARM_FORCE_MAGIC : 0.0f;
+
+    uint16_t len = mavlink_msg_command_long_pack(
+        COMPANION_SYSID, COMPANION_COMPID, buf,
+        PIXHAWK_SYSID, 0,
+        MAV_CMD_COMPONENT_ARM_DISARM, 0,
+        arm_param, force_param, 0, 0, 0, 0, 0);
+    send_mavlink_message(buf, len);
+
+    const char *cmd = arm ? (force ? "FORCE ARM" : "ARM") : "DISARM";
+    add_log("Sent %s command", cmd);
+    ESP_LOGI(TAG, "Sent %s command", cmd);
+}
+
+static void send_mode_command(uint32_t mode) {
+    uint8_t buf[32];
+    uint8_t base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+    if (is_armed) base_mode |= MAV_MODE_FLAG_SAFETY_ARMED;
+
+    uint16_t len = mavlink_msg_set_mode_pack(
+        COMPANION_SYSID, COMPANION_COMPID, buf,
+        PIXHAWK_SYSID, base_mode, mode);
+    send_mavlink_message(buf, len);
+    add_log("Set mode: %s", get_mode_name(mode));
+}
+
+static void send_param_set(const char *param_id, float value) {
+    uint8_t buf[48];
+    uint16_t len = mavlink_msg_param_set_pack(
+        COMPANION_SYSID, COMPANION_COMPID, buf,
+        PIXHAWK_SYSID, 0, param_id, value, MAV_PARAM_TYPE_REAL32);
+    send_mavlink_message(buf, len);
+    add_log("PARAM_SET: %s = %.0f", param_id, value);
+}
+
+static void send_rc_override(uint16_t ch1, uint16_t ch2, uint16_t ch3, uint16_t ch4) {
+    uint8_t buf[32];
+    uint16_t len = mavlink_msg_rc_channels_override_pack(
+        COMPANION_SYSID, COMPANION_COMPID, buf,
+        PIXHAWK_SYSID, 0,
+        ch1, ch2, ch3, ch4,
+        UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX);
+    send_mavlink_message(buf, len);
+}
+
+static void send_rc_override_throttle_low(void) {
+    send_rc_override(0, 0, 1000, 0);
+}
+
+static void disable_prearm_checks(void) {
+    add_log("Disabling checks & failsafes...");
+    send_param_set("ARMING_CHECK", 0);   vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("FS_THR_ENABLE", 0);  vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("FS_GCS_ENABLE", 0);  vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("DISARM_DELAY", 0);   vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("SYSID_MYGCS", (float)COMPANION_SYSID);
+    add_log("Set SYSID_MYGCS=%d", COMPANION_SYSID);
+}
+
+static void setup_geofence(void) {
+    add_log("Geofence: alt=%.0fm rad=%.0fm", FENCE_ALT_MAX, FENCE_RADIUS);
+    send_param_set("FENCE_TYPE", 3);          vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("FENCE_ALT_MAX", FENCE_ALT_MAX); vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("FENCE_RADIUS", FENCE_RADIUS);   vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("FENCE_ACTION", 2);        vTaskDelay(pdMS_TO_TICKS(100));
+    send_param_set("FENCE_ENABLE", 1);        vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static void send_takeoff_command(float altitude) {
+    add_log("Takeoff cmd: %.1fm", altitude);
+    uint8_t buf[64];
+    uint16_t len = mavlink_msg_command_long_pack(
+        COMPANION_SYSID, COMPANION_COMPID, buf,
+        PIXHAWK_SYSID, 0,
+        MAV_CMD_NAV_TAKEOFF, 0,
+        0, 0, 0, 0, 0, 0, altitude);
+    send_mavlink_message(buf, len);
+}
+
+/* ========================== AUTO-FLIGHT SEQUENCE ========================== */
+
+static void auto_sequence_tick(void) {
+    if (seq_state == SEQ_IDLE || seq_state == SEQ_COMPLETE || seq_state == SEQ_ABORTED)
+        return;
+
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    if (seq_abort_flag) {
+        seq_abort_flag = false;
+        add_log("!! ABORT: switching to LAND !!");
+        send_mode_command(9);
+        seq_state = SEQ_ABORTED;
+        return;
+    }
+
+    switch (seq_state) {
+
+    case SEQ_PREFLIGHT:
+        if (gps_fix_type < 3 || gps_satellites < 6) {
+            if ((now - seq_timer) % 5000 < 250)
+                add_log("Waiting GPS (fix=%d sats=%d)...", gps_fix_type, gps_satellites);
+            if ((now - seq_timer) > 30000) {
+                add_log("GPS timeout - aborting");
+                seq_state = SEQ_ABORTED;
+            }
+            return;
+        }
+        add_log("GPS OK (fix=%d sats=%d)", gps_fix_type, gps_satellites);
+        disable_prearm_checks();
+        setup_geofence();
+        seq_state = SEQ_ARMING;
+        seq_timer = now;
+        seq_phase_start = now;
+        add_log("PREFLIGHT -> ARMING");
+        break;
+
+    case SEQ_ARMING:
+        if (is_armed) {
+            seq_state = SEQ_TAKEOFF;
+            seq_timer = now;
+            seq_last_tkoff_send = 0;
+            add_log("ARMED -> TAKEOFF");
+            send_takeoff_command(seq_target_alt);
+            return;
+        }
+        if ((now - seq_phase_start) > SEQ_ARM_TIMEOUT_MS) {
+            add_log("Failed to arm - aborting");
+            seq_state = SEQ_ABORTED;
+            break;
+        }
+        if (pixhawk_custom_mode != 4) {
+            send_mode_command(4);
+            add_log("Setting GUIDED mode...");
+            return;
+        }
+        if ((now - seq_timer) > 2000) {
+            send_rc_override_throttle_low();
+            send_arm_command(true, false);
+            add_log("Arm attempt...");
+            seq_timer = now;
+        }
+        break;
+
+    case SEQ_TAKEOFF: {
+        float rel_alt_m = global_rel_alt / 1000.0f;
+        if (seq_last_tkoff_send == 0) seq_last_tkoff_send = now;
+        if ((now - seq_last_tkoff_send) > 3000) {
+            send_takeoff_command(seq_target_alt);
+            seq_last_tkoff_send = now;
+        }
+        if (rel_alt_m >= (seq_target_alt - SEQ_ALT_TOLERANCE)) {
+            seq_state = SEQ_HOVERING;
+            seq_timer = now;
+            seq_hover_remaining = seq_hover_seconds;
+            add_log("Reached %.1fm - hovering %ds", rel_alt_m, seq_hover_seconds);
+            return;
+        }
+        if ((now - seq_timer) > SEQ_TAKEOFF_TIMEOUT_MS) {
+            add_log("Takeoff timeout (%.1fm) - LAND", rel_alt_m);
+            send_mode_command(9);
+            seq_state = SEQ_ABORTED;
+        }
+        break;
+    }
+
+    case SEQ_HOVERING: {
+        int elapsed = (int)((now - seq_timer) / 1000);
+        seq_hover_remaining = seq_hover_seconds - elapsed;
+        if (seq_hover_remaining <= 0) {
+            seq_hover_remaining = 0;
+            add_log("Hover done - LANDING");
+            send_mode_command(9);
+            seq_state = SEQ_LANDING;
+            seq_timer = now;
+        }
+        break;
+    }
+
+    case SEQ_LANDING:
+        if (pixhawk_custom_mode != 9) send_mode_command(9);
+        if (!is_armed) {
+            seq_state = SEQ_COMPLETE;
+            add_log("Landed & disarmed - COMPLETE!");
+            return;
+        }
+        if ((now - seq_timer) > 30000) {
+            add_log("Still landing...");
+            seq_timer = now;
+        }
+        break;
+
+    default: break;
+    }
+}
+
+/* ========================== MAVLINK MESSAGE HANDLERS ====================== */
+
+static void handle_heartbeat(const mavlink_message_t *msg) {
+    if (msg->sysid == 255 || msg->sysid == COMPANION_SYSID) return;
+
+    mavlink_heartbeat_t hb;
+    mavlink_msg_heartbeat_decode(msg, &hb);
+
+    bool new_armed = (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
+
+    if (heartbeat_count > 0 && pixhawk_custom_mode != hb.custom_mode)
+        add_log("Mode: %s -> %s", get_mode_name(pixhawk_custom_mode), get_mode_name(hb.custom_mode));
+    if (heartbeat_count > 0 && is_armed != new_armed)
+        add_log("%s", new_armed ? ">>> ARMED <<<" : ">>> DISARMED <<<");
+
+    heartbeat_count++;
+    pixhawk_base_mode = hb.base_mode;
+    pixhawk_custom_mode = hb.custom_mode;
+    pixhawk_system_status = hb.system_status;
+    is_armed = new_armed;
+    is_connected = true;
+    last_heartbeat_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+static void handle_attitude(const mavlink_message_t *msg) {
+    mavlink_attitude_t att;
+    mavlink_msg_attitude_decode(msg, &att);
+    current_roll = mavlink_rad_to_deg(att.roll);
+    current_pitch = mavlink_rad_to_deg(att.pitch);
+    current_yaw = mavlink_rad_to_deg(att.yaw);
+}
+
+static void handle_gps_raw_int(const mavlink_message_t *msg) {
+    mavlink_gps_raw_int_t gps;
+    mavlink_msg_gps_raw_int_decode(msg, &gps);
+    gps_lat = gps.lat;
+    gps_lon = gps.lon;
+    gps_alt = gps.alt;
+    gps_fix_type = gps.fix_type;
+    gps_satellites = gps.satellites_visible;
+    gps_eph = gps.eph;
+    gps_has_data = true;
+}
+
+static void handle_global_position_int(const mavlink_message_t *msg) {
+    mavlink_global_position_int_t pos;
+    mavlink_msg_global_position_int_decode(msg, &pos);
+    global_rel_alt = pos.relative_alt;
+}
+
+static void handle_scaled_pressure(const mavlink_message_t *msg) {
+    mavlink_scaled_pressure_t press;
+    mavlink_msg_scaled_pressure_decode(msg, &press);
+    baro_press_abs = press.press_abs;
+    baro_temperature = press.temperature;
+    baro_has_data = true;
+}
+
+static void handle_vfr_hud(const mavlink_message_t *msg) {
+    mavlink_vfr_hud_t hud;
+    mavlink_msg_vfr_hud_decode(msg, &hud);
+    vfr_groundspeed = hud.groundspeed;
+    vfr_alt = hud.alt;
+    vfr_climb = hud.climb;
+    vfr_heading = hud.heading;
+    vfr_throttle = hud.throttle;
+    vfr_has_data = true;
+}
+
+static void handle_sys_status(const mavlink_message_t *msg) {
+    mavlink_sys_status_t sys;
+    mavlink_msg_sys_status_decode(msg, &sys);
+    batt_voltage = sys.voltage_battery;
+    batt_current = sys.current_battery;
+    batt_remaining = sys.battery_remaining;
+    batt_has_data = true;
+}
+
+static void handle_command_ack(const mavlink_message_t *msg) {
+    mavlink_command_ack_t ack;
+    mavlink_msg_command_ack_decode(msg, &ack);
+    const char *res = mavlink_result_to_string(ack.result);
+    add_log("CMD %d: %s", ack.command, res);
+}
+
+static void handle_statustext(const mavlink_message_t *msg) {
+    mavlink_statustext_t text;
+    mavlink_msg_statustext_decode(msg, &text);
+    char safe[51];
+    int len = 0;
+    for (int i = 0; i < 50 && text.text[i] >= 32 && text.text[i] <= 126; i++)
+        safe[len++] = text.text[i];
+    safe[len] = '\0';
+    add_log("[%s] %s", mavlink_severity_to_string(text.severity), safe);
+}
+
+static void handle_param_value(const mavlink_message_t *msg) {
+    mavlink_param_value_t param;
+    mavlink_msg_param_value_decode(msg, &param);
+    char id[17];
+    memcpy(id, param.param_id, 16);
+    id[16] = '\0';
+    add_log("PARAM: %s = %.2f", id, param.param_value);
+}
+
+static void process_mavlink_message(const mavlink_message_t *msg) {
+    switch (msg->msgid) {
+        case MAVLINK_MSG_ID_HEARTBEAT:           handle_heartbeat(msg); break;
+        case MAVLINK_MSG_ID_SYS_STATUS:          handle_sys_status(msg); break;
+        case MAVLINK_MSG_ID_ATTITUDE:            handle_attitude(msg); break;
+        case MAVLINK_MSG_ID_GPS_RAW_INT:         handle_gps_raw_int(msg); break;
+        case MAVLINK_MSG_ID_SCALED_PRESSURE:     handle_scaled_pressure(msg); break;
+        case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: handle_global_position_int(msg); break;
+        case MAVLINK_MSG_ID_VFR_HUD:             handle_vfr_hud(msg); break;
+        case MAVLINK_MSG_ID_COMMAND_ACK:         handle_command_ack(msg); break;
+        case MAVLINK_MSG_ID_PARAM_VALUE:         handle_param_value(msg); break;
+        case MAVLINK_MSG_ID_STATUSTEXT:          handle_statustext(msg); break;
+    }
+}
+
+/* ========================== DETECTION UPDATE (EI interface) ================ */
+
+void update_detection_data(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+                           float confidence, const char *label)
+{
+    ei_printf("[Detection] %s (%.2f) at (%u,%u) %ux%u\r\n",
+              label, confidence, (unsigned)x, (unsigned)y, (unsigned)width, (unsigned)height);
+
     if (detection_mutex && xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(100))) {
         latest_detection.x = x;
         latest_detection.y = y;
@@ -173,390 +681,384 @@ void update_detection_data(uint32_t x, uint32_t y, uint32_t width, uint32_t heig
         strncpy(latest_detection.label, label, sizeof(latest_detection.label) - 1);
         latest_detection.label[sizeof(latest_detection.label) - 1] = '\0';
         latest_detection.valid = (confidence > 0.0f);
-        
-        ei_printf("[WiFi Update] Updated: valid=%d, label=%s, conf=%.2f\r\n", 
-                  latest_detection.valid, latest_detection.label, latest_detection.confidence);
-        
-        /* Trigger alarm if fire detected with high confidence */
-        if (confidence > 0.5f) {
-            if (!alarm_active && alarm_acknowledged) {
-                /* Reset acknowledgment for new fire after previous was cleared */
-                alarm_acknowledged = false;
-            }
-            if (!alarm_acknowledged) {
-                alarm_active = true;
-                ei_printf("[ALARM] Fire detected! Alarm activated!\r\n");
-                trigger_alarm_log = true;
-            }
-        } else if (confidence == 0.0f && alarm_acknowledged) {
-            /* Reset alarm state when no fire and previous alarm was acknowledged */
-            alarm_acknowledged = false;
+
+        if (confidence > 0.5f && !alarm_active) {
+            alarm_active = true;
+            add_log("[FIRE] Detected: %s %.0f%%", label, confidence * 100.0f);
+        } else if (confidence == 0.0f) {
             alarm_active = false;
         }
-        
+
         xSemaphoreGive(detection_mutex);
-    } else {
-        ei_printf("[WiFi Update] ERROR: Failed to acquire mutex!\r\n");
-    }
-    
-    /* Add log AFTER releasing mutex to avoid deadlock */
-    if (trigger_alarm_log) {
-        add_log("[ALARM] Fire detected!");
     }
 }
 
-/* WiFi AP Mode Setup ------------------------------------------------------ */
+/* ========================== WIFI AP ======================================= */
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void* event_data)
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
 {
-    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-        ESP_LOGI(TAG, "Station connected, MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-                 event->mac[0], event->mac[1], event->mac[2],
-                 event->mac[3], event->mac[4], event->mac[5]);
+    if (event_id == WIFI_EVENT_AP_STACONNECTED)
         add_log("[WiFi] Client connected");
-    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        ESP_LOGI(TAG, "Station disconnected");
+    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
         add_log("[WiFi] Client disconnected");
-    }
 }
 
-void wifi_init_softap(void)
-{
+static void wifi_init_softap(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,
-                                                ESP_EVENT_ANY_ID,
-                                                &wifi_event_handler,
-                                                NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
 
     wifi_config_t wifi_config = {};
-    strcpy((char*)wifi_config.ap.ssid, WIFI_SSID);
-    strcpy((char*)wifi_config.ap.password, WIFI_PASS);
+    strcpy((char *)wifi_config.ap.ssid, WIFI_SSID);
+    strcpy((char *)wifi_config.ap.password, WIFI_PASS);
     wifi_config.ap.ssid_len = strlen(WIFI_SSID);
     wifi_config.ap.channel = WIFI_CHANNEL;
     wifi_config.ap.max_connection = MAX_CONNECTIONS;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-    if (strlen(WIFI_PASS) == 0) {
-        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-    }
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "WiFi AP started. SSID:%s Password:%s", WIFI_SSID, WIFI_PASS);
-    ESP_LOGI(TAG, "Connect to http://192.168.4.1");
-    add_log("[WiFi] AP Mode started - Connect to ESP32-FireDetect");
-    add_log("[WiFi] Web interface: http://192.168.4.1");
+    ESP_LOGI(TAG, "WiFi AP: %s / %s", WIFI_SSID, WIFI_PASS);
+    add_log("WiFi AP: %s", WIFI_SSID);
 }
 
-/* Web Server Handlers ----------------------------------------------------- */
+/* ========================== HTML DASHBOARD ================================ */
 
-#define PART_BOUNDARY "123456789000000000000987654321"
-static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
-static const char* html_page = 
+static const char HTML_PAGE1[] =
 "<!DOCTYPE html>\n"
-"<html>\n"
-"<head>\n"
-"<meta charset='UTF-8'>\n"
+"<html><head><meta charset='UTF-8'>\n"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
-"<title>Fire Detection</title>\n"
+"<title>Drone Fire Detection</title>\n"
 "<style>\n"
-"body{font-family:Arial;background:#222;color:#fff;padding:20px;margin:0}\n"
-"h1{color:#f44;text-align:center}\n"
-".box{background:#333;padding:15px;margin:10px 0;border-radius:8px}\n"
-".video-container{position:relative;width:640px;max-width:100%;margin:10px auto}\n"
-"#frame{width:100%;height:auto;border:2px solid #555;display:block}\n"
-"canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}\n"
-".logs{background:#111;padding:10px;height:150px;overflow-y:scroll;font-family:monospace;font-size:12px}\n"
-".controls{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}\n"
-".btn{padding:10px 15px;border:none;border-radius:5px;cursor:pointer;font-size:14px;font-weight:bold}\n"
-".btn-blue{background:#2196F3;color:#fff}.btn-blue:hover{background:#1976D2}\n"
-".btn-green{background:#4CAF50;color:#fff}.btn-green:hover{background:#388E3C}\n"
-".btn-orange{background:#FF9800;color:#fff}.btn-orange:hover{background:#F57C00}\n"
-".btn-active{box-shadow:0 0 10px #fff}\n"
-".mode-box{display:flex;gap:10px;align-items:center}\n"
-".mode-indicator{padding:5px 15px;border-radius:5px;font-weight:bold}\n"
-".mode-forest{background:#4CAF50;color:#fff}\n"
-".mode-drone{background:#2196F3;color:#fff}\n"
-"</style>\n"
-"</head>\n"
-"<body>\n"
-"<h1>Fire Detection Monitor</h1>\n"
-"<div class='box'>\n"
-"<h3>Detection Mode</h3>\n"
-"<div class='mode-box'>\n"
-"<button class='btn btn-green' id='btnForest' onclick='setMode(0)'>Forest Mode</button>\n"
-"<button class='btn btn-blue' id='btnDrone' onclick='setMode(1)'>Drone Mode</button>\n"
-"<span class='mode-indicator' id='modeIndicator'>Forest</span>\n"
+"*{box-sizing:border-box;margin:0;padding:0}\n"
+"body{font-family:'Segoe UI',Arial,sans-serif;background:#0d1117;color:#e6edf3;padding:8px}\n"
+".ct{max-width:640px;margin:0 auto}\n"
+"h1{text-align:center;color:#58a6ff;margin-bottom:12px;font-size:20px}\n"
+".cd{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:12px;margin-bottom:10px}\n"
+".cd h2{color:#58a6ff;margin-bottom:8px;font-size:13px;text-transform:uppercase;letter-spacing:1px;"
+"border-bottom:1px solid #21262d;padding-bottom:5px}\n"
+".sb{display:flex;flex-wrap:wrap;gap:6px}\n"
+".si{flex:1;min-width:55px;text-align:center;background:#0d1117;border-radius:8px;padding:6px}\n"
+".sv{font-size:15px;font-weight:700}.sl{font-size:10px;color:#8b949e;margin-top:2px}\n"
+".gd{color:#3fb950}.bd{color:#f85149}.wd{color:#d29922}\n"
+".cam{position:relative;width:100%}#frm{width:100%;display:block;border-radius:8px}\n"
+"#ovl{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}\n"
+".fa{background:#da3633;color:#fff;text-align:center;padding:8px;border-radius:8px;"
+"margin:8px 0;font-weight:700;display:none;animation:pulse 1s infinite}\n"
+"@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}\n"
+".br{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}\n"
+".bt{flex:1;padding:10px;border:none;border-radius:8px;font-size:12px;font-weight:700;"
+"cursor:pointer;min-width:55px;text-transform:uppercase}\n"
+".bt:active{transform:scale(.97)}\n"
+".b-arm{background:#da3633;color:#fff}.b-frc{background:#d29922;color:#fff}\n"
+".b-dis{background:#238636;color:#fff}.b-set{background:#1f6feb;color:#fff}\n"
+".b-rc{background:#238636;color:#fff}.b-rs{background:#da3633;color:#fff}\n"
+".b-tk{background:#6e40c9;color:#fff;flex:2}.b-ab{background:#da3633;color:#fff;flex:1}\n"
+".b-cm{background:#30363d;color:#e6edf3}\n"
+"select{width:100%;padding:8px;font-size:13px;border-radius:8px;border:1px solid #30363d;"
+"background:#0d1117;color:#e6edf3;margin-top:6px}\n"
+".rg{margin-bottom:6px}\n"
+".rl{display:flex;justify-content:space-between;font-size:11px;color:#8b949e;margin-bottom:2px}\n"
+".rl span:last-child{color:#e6edf3;font-weight:700;font-family:monospace}\n"
+"input[type=range]{-webkit-appearance:none;width:100%;height:14px;background:#21262d;"
+"border-radius:7px;outline:none;margin:4px 0}\n"
+"input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:32px;height:32px;"
+"background:#58a6ff;border-radius:50%;cursor:pointer;border:2px solid #1f6feb}\n"
+".dg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}\n"
+".di{background:#0d1117;border-radius:6px;padding:6px;text-align:center}\n"
+".dv{font-size:14px;font-weight:700}.dl{font-size:9px;color:#8b949e;margin-top:1px;text-transform:uppercase}\n"
+".co .ch{cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none}\n"
+".co .ch::after{content:'\\25BC';font-size:9px;color:#8b949e;transition:transform .2s}\n"
+".co.cl .ch::after{transform:rotate(-90deg)}.co.cl .cb{display:none}\n"
+".lg{background:#010409;border:1px solid #21262d;border-radius:6px;padding:6px;"
+"height:140px;overflow-y:auto;font-family:monospace;font-size:10px;line-height:1.5}\n"
+".le{padding:1px 0;border-bottom:1px solid #161b22;color:#8b949e}\n"
+".sq{background:#0d1117;border-radius:8px;padding:8px;text-align:center;margin-bottom:6px}\n"
+".ss{font-size:18px;font-weight:700}\n"
+".ft{text-align:center;color:#484f58;font-size:9px;margin-top:8px}\n"
+"</style></head><body><div class='ct'>\n"
+"<h1>&#128681; DRONE FIRE DETECTION</h1>\n";
+
+static const char HTML_PAGE2[] =
+"<div class='cd'><div class='sb'>\n"
+"<div class='si'><div id='conn' class='sv bd'>---</div><div class='sl'>Link</div></div>\n"
+"<div class='si'><div id='armed' class='sv'>---</div><div class='sl'>Armed</div></div>\n"
+"<div class='si'><div id='mode' class='sv' style='font-size:12px'>---</div><div class='sl'>Mode</div></div>\n"
+"<div class='si'><div id='bv' class='sv'>---</div><div class='sl'>Volts</div></div>\n"
+"<div class='si'><div id='bp' class='sv'>---</div><div class='sl'>Batt%</div></div>\n"
+"</div></div>\n"
+"<div class='cd'><h2>Camera Feed</h2>\n"
+"<div class='cam'><img id='frm'><canvas id='ovl'></canvas></div>\n"
+"<div id='fireAlert' class='fa'>&#128293; FIRE DETECTED!</div>\n"
+"<div style='margin-top:6px;font-size:11px;color:#8b949e' id='det'>Waiting...</div>\n"
+"<div class='br' style='margin-top:6px'>\n"
+"<button class='bt b-cm' onclick='toggleVF()'>V-Flip</button>\n"
+"<button class='bt b-cm' onclick='toggleHF()'>H-Flip</button></div></div>\n"
+"<div class='cd'><h2>Controls</h2>\n"
+"<div class='br'>\n"
+"<button class='bt b-set' onclick='doSetup()'>Setup</button>\n"
+"<button class='bt b-arm' onclick='doArm()'>Arm</button>\n"
+"<button class='bt b-frc' onclick='doForce()'>Force</button>\n"
+"<button class='bt b-dis' onclick='doDisarm()'>Disarm</button></div>\n"
+"<select id='ms' onchange='doMode()'>\n"
+"<option value=''>-- Flight Mode --</option>\n"
+"<option value='0'>STABILIZE</option><option value='1'>ACRO</option>\n"
+"<option value='2'>ALT_HOLD</option><option value='3'>AUTO</option>\n"
+"<option value='4'>GUIDED</option><option value='5'>LOITER</option>\n"
+"<option value='6'>RTL</option><option value='7'>CIRCLE</option>\n"
+"<option value='9'>LAND</option><option value='16'>POSHOLD</option>\n"
+"<option value='17'>BRAKE</option><option value='21'>SMART_RTL</option>\n"
+"</select></div>\n";
+
+static const char HTML_PAGE3[] =
+"<div class='cd co cl'><h2 class='ch' onclick='tc(this)'>RC Override</h2><div class='cb'>\n"
+"<div class='rg'><div class='rl'><span>Throttle (CH3)</span><span id='tv'>1000</span></div>\n"
+"<input type='range' id='thr' min='1000' max='2000' value='1000' step='10'></div>\n"
+"<div class='rg'><div class='rl'><span>Yaw (CH4)</span><span id='yv'>1500</span></div>\n"
+"<input type='range' id='yrc' min='1000' max='2000' value='1500' step='10'></div>\n"
+"<div class='rg'><div class='rl'><span>Pitch (CH2)</span><span id='pv'>1500</span></div>\n"
+"<input type='range' id='prc' min='1000' max='2000' value='1500' step='10'></div>\n"
+"<div class='rg'><div class='rl'><span>Roll (CH1)</span><span id='rv'>1500</span></div>\n"
+"<input type='range' id='rrc' min='1000' max='2000' value='1500' step='10'></div>\n"
+"<div class='br'>\n"
+"<button class='bt b-rc' onclick='doRcS()'>Send RC</button>\n"
+"<button class='bt b-rs' onclick='doRcX()'>Release</button></div></div></div>\n"
+"<div class='cd'><h2>&#128640; Auto Flight</h2>\n"
+"<div class='sq'><div class='ss' id='sqs' style='color:#8b949e'>IDLE</div>\n"
+"<div id='sqc' style='display:none;font-size:14px;color:#d29922;margin-top:4px'>"
+"Hover: <span id='sqv'>10</span>s</div></div>\n"
+"<div class='br'>\n"
+"<button class='bt b-tk' id='btk' onclick='doTk()'>TAKEOFF</button>\n"
+"<button class='bt b-ab' id='bab' onclick='doAb()' style='opacity:.35;pointer-events:none'>ABORT</button>\n"
+"</div></div>\n";
+
+static const char HTML_PAGE4[] =
+"<div class='cd co cl'><h2 class='ch' onclick='tc(this)'>GPS &amp; Telemetry</h2><div class='cb'>\n"
+"<div class='dg'>\n"
+"<div class='di'><div id='gf' class='dv bd'>---</div><div class='dl'>Fix</div></div>\n"
+"<div class='di'><div id='gs' class='dv'>0</div><div class='dl'>Sats</div></div>\n"
+"<div class='di'><div id='gh' class='dv'>---</div><div class='dl'>HDOP</div></div>\n"
+"<div class='di'><div id='gl' class='dv' style='font-size:11px'>---</div><div class='dl'>Lat</div></div>\n"
+"<div class='di'><div id='go' class='dv' style='font-size:11px'>---</div><div class='dl'>Lon</div></div>\n"
+"<div class='di'><div id='ga' class='dv'>---</div><div class='dl'>GPS Alt</div></div>\n"
 "</div>\n"
-"<p id='modeDesc' style='margin:10px 0;font-size:13px;color:#aaa'>Forest: Button acknowledges alarm | Drone: Buzzer auto-stops after 15s</p>\n"
-"</div>\n"
-"<div class='box'>\n"
-"<h3>Camera Controls</h3>\n"
-"<div class='controls'>\n"
-"<button class='btn btn-orange' id='btnVFlip' onclick='toggleVFlip()'>Flip Vertical</button>\n"
-"<button class='btn btn-blue' id='btnHFlip' onclick='toggleHFlip()'>Flip Horizontal</button>\n"
-"</div>\n"
-"</div>\n"
-"<div class='box'>\n"
-"<div class='video-container'>\n"
-"<img id='frame'>\n"
-"<canvas id='c'></canvas>\n"
-"</div>\n"
-"</div>\n"
-"<div class='box' id='info'>Waiting for detection...</div>\n"
-"<div class='box'><h3>Logs</h3><div class='logs' id='logs'></div></div>\n"
+"<div class='dg' style='margin-top:6px'>\n"
+"<div class='di'><div id='ar' class='dv'>---</div><div class='dl'>Roll</div></div>\n"
+"<div class='di'><div id='ap' class='dv'>---</div><div class='dl'>Pitch</div></div>\n"
+"<div class='di'><div id='ay' class='dv'>---</div><div class='dl'>Yaw</div></div>\n"
+"<div class='di'><div id='va' class='dv'>---</div><div class='dl'>Alt MSL</div></div>\n"
+"<div class='di'><div id='ra' class='dv'>---</div><div class='dl'>Rel Alt</div></div>\n"
+"<div class='di'><div id='vg' class='dv'>---</div><div class='dl'>GndSpd</div></div>\n"
+"<div class='di'><div id='vh' class='dv'>---</div><div class='dl'>Heading</div></div>\n"
+"<div class='di'><div id='vc' class='dv'>---</div><div class='dl'>Climb</div></div>\n"
+"<div class='di'><div id='vt' class='dv'>---</div><div class='dl'>Thr%</div></div>\n"
+"</div></div></div>\n"
+"<div class='cd'><h2>Logs</h2><div id='logs' class='lg'></div></div>\n"
+"<div class='ft'>ESP32-CAM Companion &bull; SysID 200 &bull; MAVLink v2</div>\n"
+"</div>\n";
+
+static const char HTML_PAGE5[] =
 "<script>\n"
-"let c=document.getElementById('c'),ctx=c.getContext('2d'),img=document.getElementById('frame');\n"
-"let lastDetection=null,fetching=false,currentMode=0,vflip=false,hflip=false;\n"
-"function updateModeUI(mode){\n"
-"currentMode=mode;\n"
-"document.getElementById('btnForest').classList.toggle('btn-active',mode==0);\n"
-"document.getElementById('btnDrone').classList.toggle('btn-active',mode==1);\n"
-"let ind=document.getElementById('modeIndicator');\n"
-"ind.textContent=mode==0?'Forest':'Drone';\n"
-"ind.className='mode-indicator '+(mode==0?'mode-forest':'mode-drone');\n"
-"}\n"
-"function setMode(m){fetch('/api/mode?mode='+m).then(r=>r.json()).then(d=>updateModeUI(d.mode)).catch(e=>console.error(e));}\n"
-"function toggleVFlip(){fetch('/api/camera/vflip').then(r=>r.json()).then(d=>{vflip=d.vflip;document.getElementById('btnVFlip').classList.toggle('btn-active',vflip);}).catch(e=>console.error(e));}\n"
-"function toggleHFlip(){fetch('/api/camera/hflip').then(r=>r.json()).then(d=>{hflip=d.hflip;document.getElementById('btnHFlip').classList.toggle('btn-active',hflip);}).catch(e=>console.error(e));}\n"
-"function drawOverlay(){\n"
-"if(!c.width||!c.height)return;\n"
-"ctx.clearRect(0,0,c.width,c.height);\n"
-"if(lastDetection && lastDetection.valid && lastDetection.confidence>0){\n"
-"let scaleX=c.width/96,scaleY=c.height/96;\n"
-"let x=lastDetection.x*scaleX,y=lastDetection.y*scaleY,w=lastDetection.width*scaleX,h=lastDetection.height*scaleY;\n"
+"var rcA=false,fetching=false;\n"
+"var c=document.getElementById('ovl'),ctx=c.getContext('2d'),img=document.getElementById('frm');\n"
+"\n"
+"function update(){\n"
+"fetch('/api/data').then(r=>r.json()).then(d=>{\n"
+"document.getElementById('conn').textContent=d.cn?'OK':'LOST';\n"
+"document.getElementById('conn').className='sv '+(d.cn?'gd':'bd');\n"
+"document.getElementById('armed').textContent=d.ar?'ARMED':'SAFE';\n"
+"document.getElementById('armed').className='sv '+(d.ar?'bd':'gd');\n"
+"document.getElementById('mode').textContent=d.md;\n"
+"if(d.bh){var bv=d.bV/1000;document.getElementById('bv').textContent=bv.toFixed(1);\n"
+"document.getElementById('bv').className='sv '+(bv>11.1?'gd':(bv>10.5?'wd':'bd'));\n"
+"document.getElementById('bp').textContent=d.bP>=0?d.bP+'%':'---';\n"
+"document.getElementById('bp').className='sv '+(d.bP>25?'gd':(d.bP>10?'wd':'bd'));}\n"
+"var fc=d.gx>=3?'gd':(d.gx>=2?'wd':'bd');\n"
+"document.getElementById('gf').textContent=d.gfs;document.getElementById('gf').className='dv '+fc;\n"
+"document.getElementById('gs').textContent=d.gn;\n"
+"document.getElementById('gs').className='dv '+(d.gn>=6?'gd':(d.gn>=4?'wd':'bd'));\n"
+"var hd=d.ge/100;document.getElementById('gh').textContent=hd<99?hd.toFixed(1):'---';\n"
+"document.getElementById('gl').textContent=d.gD?(d.gla/1e7).toFixed(7):'---';\n"
+"document.getElementById('go').textContent=d.gD?(d.glo/1e7).toFixed(7):'---';\n"
+"document.getElementById('ga').textContent=d.gD?(d.gal/1000).toFixed(1):'---';\n"
+"document.getElementById('ar').innerHTML=d.rl.toFixed(1)+'&deg;';\n"
+"document.getElementById('ap').innerHTML=d.pt.toFixed(1)+'&deg;';\n"
+"document.getElementById('ay').innerHTML=d.yw.toFixed(1)+'&deg;';\n"
+"document.getElementById('va').textContent=d.vH?d.vA.toFixed(1):'---';\n"
+"document.getElementById('ra').textContent=(d.rA/1000).toFixed(1);\n"
+"document.getElementById('vg').textContent=d.vH?d.vG.toFixed(1):'---';\n"
+"document.getElementById('vh').textContent=d.vH?d.vD:'---';\n"
+"document.getElementById('vc').textContent=d.vH?d.vC.toFixed(2):'---';\n"
+"document.getElementById('vt').textContent=d.vH?d.vT:'---';\n"
+"var fa=document.getElementById('fireAlert');\n"
+"fa.style.display=d.fv?'block':'none';\n"
+"document.getElementById('det').innerHTML=d.fv?"
+"'<span style=\"color:#f85149\">FIRE: '+d.fl+' '+(d.fc*100).toFixed(0)+'%</span>':'Monitoring (no fire)';\n"
+"var ss=d.sS||0;\n"
+"document.getElementById('sqs').textContent=d.sN||'IDLE';\n"
+"document.getElementById('sqs').style.color=ss==0?'#8b949e':(ss>=6?(ss==6?'#3fb950':'#f85149'):'#d29922');\n"
+"document.getElementById('sqc').style.display=ss==4?'block':'none';\n"
+"document.getElementById('sqv').textContent=d.sH||0;\n"
+"document.getElementById('bab').style.opacity=(ss>0&&ss<6)?'1':'0.35';\n"
+"document.getElementById('bab').style.pointerEvents=(ss>0&&ss<6)?'auto':'none';\n"
+"document.getElementById('btk').style.display=(ss>0&&ss<6)?'none':'block';\n"
+"var ld=document.getElementById('logs');\n"
+"ld.innerHTML=d.lg.map(l=>'<div class=\"le\">'+l+'</div>').join('');\n"
+"ld.scrollTop=ld.scrollHeight;\n"
+"}).catch(e=>console.error(e));}\n"
+"\n"
+"function fetchFrame(){\n"
+"if(fetching)return;fetching=true;\n"
+"fetch('/api/frame',{cache:'no-store'}).then(r=>r.json()).then(d=>{\n"
+"if(d.image){img.onload=function(){c.width=img.width;c.height=img.height;\n"
+"ctx.drawImage(img,0,0,c.width,c.height);\n"
+"if(d.valid&&d.confidence>0){var sx=c.width/96,sy=c.height/96;\n"
+"var x=d.x*sx,y=d.y*sy,w=d.width*sx,h=d.height*sy;\n"
 "ctx.fillStyle='rgba(255,0,0,0.3)';ctx.fillRect(x,y,w,h);\n"
 "ctx.strokeStyle='#f00';ctx.lineWidth=3;ctx.strokeRect(x,y,w,h);\n"
-"ctx.fillStyle='#f00';ctx.font='bold 16px Arial';\n"
-"ctx.fillText(lastDetection.label+' '+(lastDetection.confidence*100).toFixed(0)+'%',x,y>20?y-5:y+h+15);\n"
-"ctx.fillStyle='rgba(0,0,0,0.7)';ctx.fillRect(5,c.height-60,200,55);\n"
-"ctx.fillStyle='#0f0';ctx.font='12px monospace';\n"
-"ctx.fillText('Detection Coords:',10,c.height-45);\n"
-"ctx.fillText('X: '+lastDetection.x+' Y: '+lastDetection.y,10,c.height-30);\n"
-"ctx.fillText('W: '+lastDetection.width+' H: '+lastDetection.height,10,c.height-15);\n"
-"document.getElementById('info').innerHTML='<h3 style=\"color:#f00\">FIRE DETECTED</h3>Label: '+lastDetection.label+'<br>Confidence: '+(lastDetection.confidence*100).toFixed(1)+'%<br>Position: ('+lastDetection.x+','+lastDetection.y+') Size: '+lastDetection.width+'x'+lastDetection.height;\n"
-"}else{\n"
-"ctx.fillStyle='rgba(0,0,0,0.7)';ctx.fillRect(5,c.height-30,150,25);\n"
-"ctx.fillStyle='#0f0';ctx.font='12px monospace';\n"
-"ctx.fillText('No detection',10,c.height-12);\n"
-"document.getElementById('info').innerHTML='<span style=\"color:#0f0\">Monitoring... (no fire)</span>';\n"
-"}\n"
-"}\n"
-"function fetchFrame(){\n"
-"if(fetching)return;\n"
-"fetching=true;\n"
-"fetch('/api/frame',{cache:'no-store'}).then(r=>r.json()).then(d=>{\n"
-"if(d.image){img.onload=function(){c.width=img.width;c.height=img.height;drawOverlay();fetching=false;setTimeout(fetchFrame,100);};img.src='data:image/jpeg;base64,'+d.image;}\n"
+"ctx.fillStyle='#f00';ctx.font='bold 14px Arial';\n"
+"ctx.fillText(d.label+' '+(d.confidence*100).toFixed(0)+'%',x,y>15?y-4:y+h+14);}\n"
+"fetching=false;setTimeout(fetchFrame,100);};\n"
+"img.src='data:image/jpeg;base64,'+d.image;}\n"
 "else{fetching=false;setTimeout(fetchFrame,100);}\n"
-"lastDetection={valid:d.valid,x:d.x,y:d.y,width:d.width,height:d.height,confidence:d.confidence,label:d.label};\n"
-"}).catch(e=>{console.error('Frame error:',e);fetching=false;setTimeout(fetchFrame,500);});\n"
-"}\n"
-"fetch('/api/settings').then(r=>r.json()).then(d=>{updateModeUI(d.mode);vflip=d.vflip;hflip=d.hflip;document.getElementById('btnVFlip').classList.toggle('btn-active',vflip);document.getElementById('btnHFlip').classList.toggle('btn-active',hflip);}).catch(e=>{});\n"
-"fetchFrame();\n"
-"setInterval(()=>{fetch('/api/logs',{cache:'no-store'}).then(r=>r.text()).then(l=>{let lines=l.split('\\n').filter(x=>x.trim()).slice(-15);document.getElementById('logs').innerHTML=lines.join('<br>')||'No logs yet...';}).catch(e=>{});},2000);\n"
-"</script>\n"
-"</body>\n"
-"</html>";
+"}).catch(e=>{fetching=false;setTimeout(fetchFrame,500);});}\n"
+"\n"
+"function doSetup(){fetch('/api/setup',{method:'POST'});}\n"
+"function doArm(){fetch('/api/arm',{method:'POST'});}\n"
+"function doForce(){fetch('/api/forcearm',{method:'POST'});}\n"
+"function doDisarm(){fetch('/api/disarm',{method:'POST'});}\n"
+"function doMode(){var m=document.getElementById('ms').value;"
+"if(m)fetch('/api/mode?m='+m,{method:'POST'});document.getElementById('ms').value='';}\n"
+"function doTk(){if(!confirm('Start auto takeoff?\\nGUIDED>ARM>5m>Hover 10s>LAND'))return;"
+"fetch('/api/takeoff',{method:'POST'});}\n"
+"function doAb(){fetch('/api/abort',{method:'POST'});}\n"
+"function toggleVF(){fetch('/api/camera/vflip');}\n"
+"function toggleHF(){fetch('/api/camera/hflip');}\n"
+"\n"
+"['thr','yrc','prc','rrc'].forEach(function(id){\n"
+"document.getElementById(id).addEventListener('input',function(){\n"
+"var m={'thr':'tv','yrc':'yv','prc':'pv','rrc':'rv'};\n"
+"document.getElementById(m[id]).textContent=this.value;\n"
+"if(rcA)sendRc();});});\n"
+"function doRcS(){rcA=true;sendRc();}\n"
+"function sendRc(){\n"
+"var t=document.getElementById('thr').value,y=document.getElementById('yrc').value,\n"
+"p=document.getElementById('prc').value,r=document.getElementById('rrc').value;\n"
+"fetch('/api/rc?r='+r+'&p='+p+'&t='+t+'&y='+y,{method:'POST'});}\n"
+"function doRcX(){rcA=false;\n"
+"document.getElementById('thr').value=1000;document.getElementById('tv').textContent='1000';\n"
+"document.getElementById('yrc').value=1500;document.getElementById('yv').textContent='1500';\n"
+"document.getElementById('prc').value=1500;document.getElementById('pv').textContent='1500';\n"
+"document.getElementById('rrc').value=1500;document.getElementById('rv').textContent='1500';\n"
+"fetch('/api/rc/stop',{method:'POST'});}\n"
+"['yrc','prc','rrc'].forEach(function(id){\n"
+"var m={'yrc':'yv','prc':'pv','rrc':'rv'};\n"
+"function snap(){document.getElementById(id).value=1500;document.getElementById(m[id]).textContent='1500';if(rcA)sendRc();}\n"
+"document.getElementById(id).addEventListener('mouseup',snap);\n"
+"document.getElementById(id).addEventListener('touchend',snap);});\n"
+"\n"
+"function tc(el){el.parentElement.classList.toggle('cl');}\n"
+"setInterval(update,500);update();fetchFrame();\n"
+"</script></body></html>";
 
-esp_err_t root_handler(httpd_req_t *req)
-{
+/* ========================== HTTP HANDLERS ================================= */
+
+/* --- Serve HTML dashboard --- */
+static esp_err_t root_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, HTML_PAGE1, sizeof(HTML_PAGE1) - 1);
+    httpd_resp_send_chunk(req, HTML_PAGE2, sizeof(HTML_PAGE2) - 1);
+    httpd_resp_send_chunk(req, HTML_PAGE3, sizeof(HTML_PAGE3) - 1);
+    httpd_resp_send_chunk(req, HTML_PAGE4, sizeof(HTML_PAGE4) - 1);
+    httpd_resp_send_chunk(req, HTML_PAGE5, sizeof(HTML_PAGE5) - 1);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
-esp_err_t api_detection_handler(httpd_req_t *req)
-{
-    char json[256];
-    
-    ei_printf("[API] Detection request received from client\r\n");
-    
-    if (xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(100))) {
-        snprintf(json, sizeof(json),
-                 "{\"valid\":%s,\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u,\"confidence\":%.2f,\"label\":\"%s\"}",
-                 latest_detection.valid ? "true" : "false",
-                 (unsigned int)latest_detection.x,
-                 (unsigned int)latest_detection.y,
-                 (unsigned int)latest_detection.width,
-                 (unsigned int)latest_detection.height,
-                 latest_detection.confidence,
-                 latest_detection.label);
-        
-        /* Debug output */
-        ei_printf("[API] Sending response: %s\r\n", json);
-        
-        xSemaphoreGive(detection_mutex);
-    } else {
-        strcpy(json, "{\"valid\":false}");
-        ei_printf("[API] Detection request failed - mutex timeout\r\n");
-    }
-    
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-    httpd_resp_set_hdr(req, "Connection", "close");  /* Close immediately to free socket */
-    
-    esp_err_t err = httpd_resp_send(req, json, strlen(json));
-    
-    if (err != ESP_OK) {
-        ei_printf("[API] Failed to send detection response: %d\r\n", err);
-    } else {
-        ei_printf("[API] Detection response sent successfully\r\n");
-    }
-    
-    return ESP_OK;
-}
+/* --- JSON telemetry + detection + logs --- */
+static esp_err_t data_handler(httpd_req_t *req) {
+    char json[2560];
+    char logs_json[800] = "[";
 
-esp_err_t api_logs_handler(httpd_req_t *req)
-{
-    ei_printf("[API] Logs request received from client\r\n");
-    
-    if (xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(100))) {
-        size_t log_len = strlen(log_buffer);
-        ei_printf("[API] Logs buffer size: %u bytes\r\n", (unsigned int)log_len);
-        
-        httpd_resp_set_type(req, "text/plain; charset=utf-8");
-        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-        httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-        httpd_resp_set_hdr(req, "Connection", "close");  /* Close immediately to free socket */
-        
-        esp_err_t err = httpd_resp_send(req, log_buffer, log_len);
-        xSemaphoreGive(detection_mutex);
-        
-        if (err != ESP_OK) {
-            ei_printf("[API] Failed to send logs: %d\r\n", err);
-        } else {
-            ei_printf("[API] Logs sent successfully (%u bytes)\r\n", (unsigned int)log_len);
-        }
-    } else {
-        ei_printf("[API] Logs request failed - mutex timeout\r\n");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Mutex timeout");
-    }
-    return ESP_OK;
-}
-
-/* Camera control API - flip vertical */
-esp_err_t api_camera_vflip_handler(httpd_req_t *req)
-{
-    camera_vflip = !camera_vflip;
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        s->set_vflip(s, camera_vflip ? 1 : 0);
-        ei_printf("[Camera] VFlip set to: %d\r\n", camera_vflip);
-        add_log(camera_vflip ? "[Camera] Vertical flip: ON" : "[Camera] Vertical flip: OFF");
-    }
-    
-    char json[64];
-    snprintf(json, sizeof(json), "{\"vflip\":%s}", camera_vflip ? "true" : "false");
-    
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Connection", "close");
-    httpd_resp_send(req, json, strlen(json));
-    return ESP_OK;
-}
-
-/* Camera control API - flip horizontal */
-esp_err_t api_camera_hflip_handler(httpd_req_t *req)
-{
-    camera_hflip = !camera_hflip;
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        s->set_hmirror(s, camera_hflip ? 1 : 0);
-        ei_printf("[Camera] HFlip set to: %d\r\n", camera_hflip);
-        add_log(camera_hflip ? "[Camera] Horizontal flip: ON" : "[Camera] Horizontal flip: OFF");
-    }
-    
-    char json[64];
-    snprintf(json, sizeof(json), "{\"hflip\":%s}", camera_hflip ? "true" : "false");
-    
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Connection", "close");
-    httpd_resp_send(req, json, strlen(json));
-    return ESP_OK;
-}
-
-/* Mode control API - Forest/Drone */
-esp_err_t api_mode_handler(httpd_req_t *req)
-{
-    char buf[32];
-    int ret = httpd_req_get_url_query_str(req, buf, sizeof(buf));
-    if (ret == ESP_OK) {
-        char param[8];
-        if (httpd_query_key_value(buf, "mode", param, sizeof(param)) == ESP_OK) {
-            int mode = atoi(param);
-            if (mode == 0 || mode == 1) {
-                detection_mode = mode;
-                const char* mode_names[] = {"Forest", "Drone"};
-                ei_printf("[Mode] Switched to: %s Detection\\r\\n", mode_names[mode]);
-                char log_msg[64];
-                snprintf(log_msg, sizeof(log_msg), "[Mode] Switched to %s Detection", mode_names[mode]);
-                add_log(log_msg);
-                
-                /* Reset alarm state on mode change */
-                alarm_active = false;
-                alarm_acknowledged = false;
-                drone_buzzer_running = false;
-                gpio_set_level(BUZZER_PIN, 0);
+    /* Build logs JSON array */
+    if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (int i = 0; i < log_count; i++) {
+            int idx = (log_head - log_count + i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
+            if (i > 0) strcat(logs_json, ",");
+            strcat(logs_json, "\"");
+            char *p = log_entries[idx];
+            char *d = logs_json + strlen(logs_json);
+            while (*p && (d - logs_json) < 780) {
+                if (*p == '"') { *d++ = '\\'; }
+                if (*p == '\\' && *(p + 1) != '"') { *d++ = '\\'; }
+                *d++ = *p++;
             }
+            *d = '\0';
+            strcat(logs_json, "\"");
         }
+        xSemaphoreGive(log_mutex);
     }
-    
-    char json[64];
-    snprintf(json, sizeof(json), "{\"mode\":%d,\"modeName\":\"%s\"}", detection_mode, detection_mode == 0 ? "Forest" : "Drone");
-    
+    strcat(logs_json, "]");
+
+    /* Get detection data */
+    bool fv = false; float fc = 0; char fl[32] = "";
+    if (xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(50))) {
+        fv = latest_detection.valid;
+        fc = latest_detection.confidence;
+        strncpy(fl, latest_detection.label, 31);
+        xSemaphoreGive(detection_mutex);
+    }
+
+    snprintf(json, sizeof(json),
+        "{\"cn\":%s,\"ar\":%s,\"md\":\"%s\","
+        "\"rl\":%.2f,\"pt\":%.2f,\"yw\":%.2f,"
+        "\"gD\":%s,\"gx\":%d,\"gfs\":\"%s\",\"gn\":%d,\"ge\":%d,"
+        "\"gla\":%ld,\"glo\":%ld,\"gal\":%ld,\"rA\":%ld,"
+        "\"bh\":%s,\"bV\":%d,\"bA\":%d,\"bP\":%d,"
+        "\"vH\":%s,\"vA\":%.2f,\"vG\":%.2f,\"vD\":%d,\"vC\":%.2f,\"vT\":%d,"
+        "\"fv\":%s,\"fc\":%.2f,\"fl\":\"%s\","
+        "\"sS\":%d,\"sH\":%d,\"sN\":\"%s\","
+        "\"lg\":%s}",
+        is_connected ? "true" : "false",
+        is_armed ? "true" : "false",
+        get_mode_name(pixhawk_custom_mode),
+        current_roll, current_pitch, current_yaw,
+        gps_has_data ? "true" : "false", gps_fix_type,
+        mavlink_gps_fix_type_string(gps_fix_type), gps_satellites, gps_eph,
+        (long)gps_lat, (long)gps_lon, (long)gps_alt, (long)global_rel_alt,
+        batt_has_data ? "true" : "false", batt_voltage, batt_current, batt_remaining,
+        vfr_has_data ? "true" : "false", vfr_alt, vfr_groundspeed, vfr_heading, vfr_climb, vfr_throttle,
+        fv ? "true" : "false", fc, fl,
+        (int)seq_state, seq_hover_remaining, seq_state_name(seq_state),
+        logs_json);
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, json, strlen(json));
+
+    rc_last_web_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
     return ESP_OK;
 }
 
-/* Get current settings API */
-esp_err_t api_settings_handler(httpd_req_t *req)
-{
-    char json[128];
-    snprintf(json, sizeof(json), 
-             "{\"mode\":%d,\"modeName\":\"%s\",\"vflip\":%s,\"hflip\":%s}",
-             detection_mode,
-             detection_mode == 0 ? "Forest" : "Drone",
-             camera_vflip ? "true" : "false",
-             camera_hflip ? "true" : "false");
-    
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Connection", "close");
-    httpd_resp_send(req, json, strlen(json));
-    return ESP_OK;
-}
-
-/* Base64 encoding table */
+/* --- Base64 helpers --- */
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static size_t base64_encode(const uint8_t *src, size_t src_len, char *dst, size_t dst_len) {
-    size_t i, j;
     size_t needed = ((src_len + 2) / 3) * 4 + 1;
     if (dst_len < needed) return 0;
-    
+    size_t i, j;
     for (i = 0, j = 0; i < src_len; i += 3, j += 4) {
         uint32_t n = ((uint32_t)src[i]) << 16;
         if (i + 1 < src_len) n |= ((uint32_t)src[i + 1]) << 8;
         if (i + 2 < src_len) n |= src[i + 2];
-        
         dst[j] = b64_table[(n >> 18) & 0x3F];
         dst[j + 1] = b64_table[(n >> 12) & 0x3F];
         dst[j + 2] = (i + 1 < src_len) ? b64_table[(n >> 6) & 0x3F] : '=';
@@ -566,23 +1068,22 @@ static size_t base64_encode(const uint8_t *src, size_t src_len, char *dst, size_
     return j;
 }
 
-/* Combined frame + detection endpoint */
-esp_err_t api_frame_handler(httpd_req_t *req)
-{
+/* --- Camera frame + detection JSON --- */
+static esp_err_t frame_handler(httpd_req_t *req) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Camera capture failed");
         return ESP_FAIL;
     }
-    
+
     uint8_t *jpg_buf = NULL;
     size_t jpg_len = 0;
     bool need_free = false;
-    
+
     if (fb->format != PIXFORMAT_JPEG) {
         if (!frame2jpg(fb, 80, &jpg_buf, &jpg_len)) {
             esp_camera_fb_return(fb);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JPEG conversion failed");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JPEG failed");
             return ESP_FAIL;
         }
         need_free = true;
@@ -590,404 +1091,371 @@ esp_err_t api_frame_handler(httpd_req_t *req)
         jpg_buf = fb->buf;
         jpg_len = fb->len;
     }
-    
-    /* Base64 encode the image */
+
     size_t b64_len = ((jpg_len + 2) / 3) * 4 + 1;
     char *b64_buf = (char *)malloc(b64_len);
     if (!b64_buf) {
         if (need_free) free(jpg_buf);
         esp_camera_fb_return(fb);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
-    
+
     base64_encode(jpg_buf, jpg_len, b64_buf, b64_len);
-    
     if (need_free) free(jpg_buf);
     esp_camera_fb_return(fb);
-    
-    /* Build JSON response with image and detection data */
+
     size_t json_size = b64_len + 256;
     char *json = (char *)malloc(json_size);
     if (!json) {
         free(b64_buf);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
-    
+
     if (xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(50))) {
         snprintf(json, json_size,
-                 "{\"image\":\"%s\",\"valid\":%s,\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u,\"confidence\":%.2f,\"label\":\"%s\"}",
+                 "{\"image\":\"%s\",\"valid\":%s,\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u,"
+                 "\"confidence\":%.2f,\"label\":\"%s\"}",
                  b64_buf,
                  latest_detection.valid ? "true" : "false",
-                 (unsigned int)latest_detection.x,
-                 (unsigned int)latest_detection.y,
-                 (unsigned int)latest_detection.width,
-                 (unsigned int)latest_detection.height,
-                 latest_detection.confidence,
-                 latest_detection.label);
+                 (unsigned)latest_detection.x, (unsigned)latest_detection.y,
+                 (unsigned)latest_detection.width, (unsigned)latest_detection.height,
+                 latest_detection.confidence, latest_detection.label);
         xSemaphoreGive(detection_mutex);
     } else {
-        snprintf(json, json_size, "{\"image\":\"%s\",\"valid\":false,\"x\":0,\"y\":0,\"width\":0,\"height\":0,\"confidence\":0,\"label\":\"\"}", b64_buf);
+        snprintf(json, json_size,
+                 "{\"image\":\"%s\",\"valid\":false,\"x\":0,\"y\":0,\"width\":0,\"height\":0,"
+                 "\"confidence\":0,\"label\":\"\"}", b64_buf);
     }
-    
+
     free(b64_buf);
-    
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Connection", "close");
-    
     esp_err_t err = httpd_resp_send(req, json, strlen(json));
     free(json);
-    
     return err;
 }
 
-esp_err_t stream_handler(httpd_req_t *req)
-{
-    camera_fb_t *fb = NULL;
-    esp_err_t res = ESP_OK;
-    size_t _jpg_buf_len = 0;
-    uint8_t *_jpg_buf = NULL;
-    char part_buf[64];
-    
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if(res != ESP_OK){
-        return res;
-    }
-    
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    
-    while(true){
-        fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGE(TAG, "Camera capture failed");
-            res = ESP_FAIL;
-            break;
-        }
-        
-        if(fb->format != PIXFORMAT_JPEG){
-            bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-            if(!jpeg_converted){
-                ESP_LOGE(TAG, "JPEG compression failed");
-                esp_camera_fb_return(fb);
-                res = ESP_FAIL;
-                break;
-            }
-        } else {
-            _jpg_buf_len = fb->len;
-            _jpg_buf = fb->buf;
-        }
-        
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        }
-        if(res == ESP_OK){
-            size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-        }
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-        }
-        
-        if(fb->format != PIXFORMAT_JPEG){
-            free(_jpg_buf);
-            _jpg_buf = NULL;
-        }
-        
-        esp_camera_fb_return(fb);
-        
-        if(res != ESP_OK){
-            break;
-        }
-        
-        /* Small delay to prevent overwhelming the connection */
-        vTaskDelay(30 / portTICK_PERIOD_MS);
-    }
-    
-    return res;
+/* --- Camera flip handlers --- */
+static esp_err_t vflip_handler(httpd_req_t *req) {
+    camera_vflip = !camera_vflip;
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) s->set_vflip(s, camera_vflip ? 1 : 0);
+    add_log("Camera V-Flip: %s", camera_vflip ? "ON" : "OFF");
+    char json[32];
+    snprintf(json, sizeof(json), "{\"vflip\":%s}", camera_vflip ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    return ESP_OK;
 }
 
-httpd_handle_t start_webserver(void)
-{
+static esp_err_t hflip_handler(httpd_req_t *req) {
+    camera_hflip = !camera_hflip;
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) s->set_hmirror(s, camera_hflip ? 1 : 0);
+    add_log("Camera H-Flip: %s", camera_hflip ? "ON" : "OFF");
+    char json[32];
+    snprintf(json, sizeof(json), "{\"hflip\":%s}", camera_hflip ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    return ESP_OK;
+}
+
+/* --- Drone control handlers --- */
+static esp_err_t setup_handler(httpd_req_t *req) {
+    disable_prearm_checks();
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t arm_handler(httpd_req_t *req) {
+    send_param_set("DISARM_DELAY", 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    send_rc_override_throttle_low();
+    send_arm_command(true, false);
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t forcearm_handler(httpd_req_t *req) {
+    send_param_set("DISARM_DELAY", 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    send_rc_override_throttle_low();
+    send_arm_command(true, true);
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t disarm_handler(httpd_req_t *req) {
+    send_arm_command(false, false);
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t mode_handler(httpd_req_t *req) {
+    char buf[32];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(buf, "m", val, sizeof(val)) == ESP_OK) {
+            uint32_t mode = atoi(val);
+            send_mode_command(mode);
+        }
+    }
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t rc_handler(httpd_req_t *req) {
+    char buf[64];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(buf, "r", val, sizeof(val)) == ESP_OK) rc_chan1 = atoi(val);
+        if (httpd_query_key_value(buf, "p", val, sizeof(val)) == ESP_OK) rc_chan2 = atoi(val);
+        if (httpd_query_key_value(buf, "t", val, sizeof(val)) == ESP_OK) rc_chan3 = atoi(val);
+        if (httpd_query_key_value(buf, "y", val, sizeof(val)) == ESP_OK) rc_chan4 = atoi(val);
+    }
+    rc_override_active = true;
+    rc_last_web_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    send_rc_override(rc_chan1, rc_chan2, rc_chan3, rc_chan4);
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t rc_stop_handler(httpd_req_t *req) {
+    rc_override_active = false;
+    rc_chan1 = 0; rc_chan2 = 0; rc_chan3 = 0; rc_chan4 = 0;
+    send_rc_override(0, 0, 0, 0);
+    add_log("RC Override released");
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t takeoff_handler(httpd_req_t *req) {
+    if (seq_state != SEQ_IDLE && seq_state != SEQ_COMPLETE && seq_state != SEQ_ABORTED) {
+        httpd_resp_send(req, "BUSY", 4);
+        return ESP_OK;
+    }
+    add_log(">>> AUTO TAKEOFF SEQUENCE <<<");
+    seq_abort_flag = false;
+    seq_hover_remaining = seq_hover_seconds;
+    seq_state = SEQ_PREFLIGHT;
+    seq_timer = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t abort_handler(httpd_req_t *req) {
+    if (seq_state > SEQ_IDLE && seq_state < SEQ_COMPLETE) {
+        seq_abort_flag = true;
+        add_log("ABORT requested");
+    } else {
+        send_mode_command(9);
+        add_log("LAND mode (no sequence active)");
+    }
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+/* ========================== WEB SERVER ==================================== */
+
+static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 8192;
-    config.max_uri_handlers = 16;  /* Increased for camera/mode control APIs */
+    config.stack_size = 10240;
+    config.max_uri_handlers = 16;
     config.lru_purge_enable = true;
-    config.max_open_sockets = 7;   /* LWIP_MAX_SOCKETS=10 minus 3 internal = 7 */
-    config.recv_wait_timeout = 5;  /* Shorter timeout for better responsiveness */
+    config.max_open_sockets = 7;
+    config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
 
     ESP_LOGI(TAG, "Starting web server on port %d", config.server_port);
 
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t root = {
-            .uri = "/",
-            .method = HTTP_GET,
-            .handler = root_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &root);
+    if (httpd_start(&http_server, &config) == ESP_OK) {
+        /* Page */
+        httpd_uri_t u_root = { .uri = "/", .method = HTTP_GET, .handler = root_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_root);
 
-        httpd_uri_t api_detection = {
-            .uri = "/api/detection",
-            .method = HTTP_GET,
-            .handler = api_detection_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &api_detection);
+        /* Data APIs */
+        httpd_uri_t u_data = { .uri = "/api/data", .method = HTTP_GET, .handler = data_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_data);
+        httpd_uri_t u_frame = { .uri = "/api/frame", .method = HTTP_GET, .handler = frame_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_frame);
 
-        httpd_uri_t api_logs = {
-            .uri = "/api/logs",
-            .method = HTTP_GET,
-            .handler = api_logs_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &api_logs);
+        /* Camera controls */
+        httpd_uri_t u_vf = { .uri = "/api/camera/vflip", .method = HTTP_GET, .handler = vflip_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_vf);
+        httpd_uri_t u_hf = { .uri = "/api/camera/hflip", .method = HTTP_GET, .handler = hflip_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_hf);
 
-        httpd_uri_t api_frame = {
-            .uri = "/api/frame",
-            .method = HTTP_GET,
-            .handler = api_frame_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &api_frame);
+        /* Drone controls */
+        httpd_uri_t u_setup = { .uri = "/api/setup", .method = HTTP_POST, .handler = setup_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_setup);
+        httpd_uri_t u_arm = { .uri = "/api/arm", .method = HTTP_POST, .handler = arm_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_arm);
+        httpd_uri_t u_frc = { .uri = "/api/forcearm", .method = HTTP_POST, .handler = forcearm_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_frc);
+        httpd_uri_t u_dis = { .uri = "/api/disarm", .method = HTTP_POST, .handler = disarm_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_dis);
+        httpd_uri_t u_mode = { .uri = "/api/mode", .method = HTTP_POST, .handler = mode_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_mode);
 
-        httpd_uri_t api_vflip = {
-            .uri = "/api/camera/vflip",
-            .method = HTTP_GET,
-            .handler = api_camera_vflip_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &api_vflip);
+        /* RC Override */
+        httpd_uri_t u_rc = { .uri = "/api/rc", .method = HTTP_POST, .handler = rc_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_rc);
+        httpd_uri_t u_rcx = { .uri = "/api/rc/stop", .method = HTTP_POST, .handler = rc_stop_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_rcx);
 
-        httpd_uri_t api_hflip = {
-            .uri = "/api/camera/hflip",
-            .method = HTTP_GET,
-            .handler = api_camera_hflip_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &api_hflip);
+        /* Auto-flight */
+        httpd_uri_t u_tk = { .uri = "/api/takeoff", .method = HTTP_POST, .handler = takeoff_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_tk);
+        httpd_uri_t u_ab = { .uri = "/api/abort", .method = HTTP_POST, .handler = abort_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(http_server, &u_ab);
 
-        httpd_uri_t api_mode = {
-            .uri = "/api/mode",
-            .method = HTTP_GET,
-            .handler = api_mode_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &api_mode);
-
-        httpd_uri_t api_settings = {
-            .uri = "/api/settings",
-            .method = HTTP_GET,
-            .handler = api_settings_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &api_settings);
-
-        httpd_uri_t stream_uri = {
-            .uri = "/stream",
-            .method = HTTP_GET,
-            .handler = stream_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &stream_uri);
-
-        add_log("[WebServer] HTTP server started successfully");
-        add_log("[WebServer] Frame+detection API at /api/frame");
-        return server;
+        add_log("[Web] Server started (14 endpoints)");
+        return http_server;
     }
 
     ESP_LOGE(TAG, "Failed to start web server");
     return NULL;
 }
 
-/* Public functions -------------------------------------------------------- */
+/* ========================== FREERTOS TASKS ================================ */
 
-void setup_led() {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-    esp_rom_gpio_pad_select_gpio(RED_LED_PIN);
-    esp_rom_gpio_pad_select_gpio(WHITE_LED_PIN);
-    esp_rom_gpio_pad_select_gpio(BUZZER_PIN);
-    esp_rom_gpio_pad_select_gpio(ACK_BUTTON_PIN);
-#elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
-    gpio_pad_select_gpio(RED_LED_PIN);
-    gpio_pad_select_gpio(WHITE_LED_PIN);
-    gpio_pad_select_gpio(BUZZER_PIN);
-    gpio_pad_select_gpio(ACK_BUTTON_PIN);
-#endif
-    gpio_set_direction(RED_LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(WHITE_LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(BUZZER_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(ACK_BUTTON_PIN, GPIO_MODE_INPUT);
-    
-    /* Enable pull-up for button */
-    gpio_set_pull_mode(ACK_BUTTON_PIN, GPIO_PULLUP_ONLY);
-    
-    /* Configure button interrupt - trigger on falling edge (button press) */
-    gpio_set_intr_type(ACK_BUTTON_PIN, GPIO_INTR_NEGEDGE);
-    
-    /* Install GPIO ISR service (may already be installed by camera) */
-    esp_err_t isr_err = gpio_install_isr_service(0);
-    if (isr_err == ESP_OK) {
-        ESP_LOGI(TAG, "GPIO ISR service installed");
-    } else if (isr_err == ESP_ERR_INVALID_STATE) {
-        ESP_LOGI(TAG, "GPIO ISR service already installed (by camera)");
-    }
-    
-    /* Attach interrupt handler to button pin */
-    gpio_isr_handler_add(ACK_BUTTON_PIN, button_isr_handler, (void*) ACK_BUTTON_PIN);
-    
-    /* Initialize outputs to OFF */
-    gpio_set_level(RED_LED_PIN, 0);
-    gpio_set_level(WHITE_LED_PIN, 0);
-    gpio_set_level(BUZZER_PIN, 0);
-    
-    ESP_LOGI(TAG, "Button interrupt configured on GPIO %d", ACK_BUTTON_PIN);
-}
-
-/* FreeRTOS Task Implementations ------------------------------------------- */
-
-void serial_task(void *pvParameters)
-{
-    while(1){
-        /* handle command coming from uart */
+/* --- Edge Impulse serial AT commands --- */
+void serial_task(void *pvParameters) {
+    while (1) {
         char data = ei_get_serial_byte();
-
         while (data != 0xFF) {
             at->handle(data);
             data = ei_get_serial_byte();
         }
-        
-        /* Small delay to prevent task starvation */
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 
-void led_task(void *pvParameters)
-{
+/* --- LED indicator task --- */
+void led_task(void *pvParameters) {
     bool led_state = false;
-    bool buzzer_state = false;
-    uint32_t buzzer_toggle_count = 0;
-    
-    while(1){
-        /* Check interrupt flag for button press - only for Forest mode */
-        if (button_pressed) {
-            button_pressed = false; // Clear flag
-            
-            if (detection_mode == 0 && alarm_active) {  /* Forest mode only */
-                alarm_acknowledged = true;
-                alarm_active = false;
-                gpio_set_level(BUZZER_PIN, 0);
-                ei_printf("[ALARM] Acknowledged by button interrupt (Forest Mode)\r\n");
-                add_log("[ALARM] Fire alarm acknowledged");
-            } else if (detection_mode == 1) {
-                ei_printf("[INFO] Button disabled in Drone mode\r\n");
-            }
-        }
-        
-        /* Toggle heartbeat LED */
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    esp_rom_gpio_pad_select_gpio(INDICATOR_LED_PIN);
+#elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
+    gpio_pad_select_gpio(INDICATOR_LED_PIN);
+#endif
+    gpio_set_direction(INDICATOR_LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(INDICATOR_LED_PIN, 1); /* Active LOW: OFF */
+
+    while (1) {
         led_state = !led_state;
-        gpio_set_level(WHITE_LED_PIN, led_state);
-        
-        /* Handle alarm buzzer based on mode */
-        if (alarm_active && !alarm_acknowledged) {
-            if (detection_mode == 1) {  /* Drone mode - 15s auto-stop */
-                if (!drone_buzzer_running) {
-                    drone_buzzer_start_time = xTaskGetTickCount();
-                    drone_buzzer_running = true;
-                    ei_printf("[ALARM] Drone mode: Buzzer started for 15 seconds\r\n");
-                    add_log("[ALARM] Drone mode: 15s buzzer started");
-                }
-                
-                uint32_t elapsed = (xTaskGetTickCount() - drone_buzzer_start_time) * portTICK_PERIOD_MS;
-                if (elapsed < DRONE_BUZZER_DURATION_MS) {
-                    buzzer_state = !buzzer_state;
-                    gpio_set_level(BUZZER_PIN, buzzer_state);
-                } else {
-                    /* 15 seconds elapsed - stop buzzer */
-                    gpio_set_level(BUZZER_PIN, 0);
-                    buzzer_state = false;
-                    alarm_acknowledged = true;  /* Auto-acknowledge */
-                    alarm_active = false;
-                    drone_buzzer_running = false;
-                    ei_printf("[ALARM] Drone mode: Buzzer auto-stopped after 15s\r\n");
-                    add_log("[ALARM] Drone mode: Buzzer auto-stopped");
-                }
-            } else {  /* Forest mode - continuous until button press */
-                buzzer_state = !buzzer_state;
-                gpio_set_level(BUZZER_PIN, buzzer_state);
-                buzzer_toggle_count++;
-                
-                if (buzzer_toggle_count % 10 == 0) {
-                    ei_printf("[ALARM] Forest mode: Press button to acknowledge\r\n");
-                }
-            }
-        } else {
-            /* Turn off buzzer if alarm is not active or acknowledged */
-            gpio_set_level(BUZZER_PIN, 0);
-            buzzer_state = false;
-            drone_buzzer_running = false;
-        }
-        
-        /* Red LED for current fire detection */
+
+        /* Blink fast if fire detected, slow otherwise */
+        bool fire = false;
         if (xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(10))) {
-            if (latest_detection.valid && latest_detection.confidence > 0.5) {
-                gpio_set_level(RED_LED_PIN, 1);
-            } else {
-                gpio_set_level(RED_LED_PIN, 0);
-            }
+            fire = latest_detection.valid && latest_detection.confidence > 0.5f;
             xSemaphoreGive(detection_mutex);
         }
-        
-        /* Delay 500ms for faster buzzer beep */
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+
+        /* Active LOW on AI-Thinker: 0 = ON, 1 = OFF */
+        if (fire) {
+            gpio_set_level(INDICATOR_LED_PIN, led_state ? 0 : 1); /* Fast blink */
+        } else if (is_connected) {
+            gpio_set_level(INDICATOR_LED_PIN, led_state ? 0 : 1); /* Slow blink */
+        } else {
+            gpio_set_level(INDICATOR_LED_PIN, 1); /* OFF when disconnected */
+        }
+
+        vTaskDelay(fire ? 200 / portTICK_PERIOD_MS : 1000 / portTICK_PERIOD_MS);
     }
 }
 
-void webserver_task(void *pvParameters)
-{
-    /* Wait for WiFi to be ready */
+/* --- Web server task --- */
+void webserver_task(void *pvParameters) {
     vTaskDelay(2000 / portTICK_PERIOD_MS);
-    
-    /* Start web server */
     start_webserver();
-    
-    /* Keep task alive */
-    while(1) {
+    while (1) {
         vTaskDelay(10000 / portTICK_PERIOD_MS);
     }
 }
 
-void inference_task(void *pvParameters)
-{
-    /* Wait for system initialization - camera and sensors need time */
+/* --- Edge Impulse inference task --- */
+void inference_task(void *pvParameters) {
     vTaskDelay(5000 / portTICK_PERIOD_MS);
-    
-    add_log("[Inference] Auto-starting continuous fire detection");
-    ei_printf("\r\n=== Fire Detection System Ready ===\r\n");
-    ei_printf("Auto-starting continuous inference...\r\n");
-    ei_printf("Web interface: http://192.168.4.1\r\n");
-    ei_printf("WiFi: SSID=%s, Password=%s\r\n", WIFI_SSID, WIFI_PASS);
-    ei_printf("Press button on GPIO 14 to acknowledge fire alarm\r\n\r\n");
-    
-    /* Start continuous inference - this function contains its own loop */
+
+    add_log("[AI] Starting fire detection inference");
+    ei_printf("\r\n=== Drone Fire Detection System Ready ===\r\n");
+    ei_printf("Web: http://192.168.4.1  WiFi: %s / %s\r\n", WIFI_SSID, WIFI_PASS);
+
     extern void ei_start_impulse(bool continuous, bool debug, bool use_max_uart_speed);
     ei_start_impulse(true, false, false);
-    
-    /* This line should never be reached unless inference stops */
-    add_log("[Inference] Stopped unexpectedly");
-    ei_printf("[ERROR] Inference stopped! Restart system.\r\n");
-    
-    while(1) {
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
+
+    add_log("[AI] Inference stopped unexpectedly!");
+    while (1) { vTaskDelay(10000 / portTICK_PERIOD_MS); }
+}
+
+/* --- MAVLink RX task: parse incoming bytes from Pixhawk --- */
+static void mavlink_rx_task(void *pvParameters) {
+    uint8_t data[128];
+    ESP_LOGI(TAG, "MAVLink RX task started");
+
+    while (1) {
+        int len = uart_read_bytes(MAV_UART_NUM, data, sizeof(data), pdMS_TO_TICKS(100));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                uint8_t result = mavlink_parse_char(0, data[i], &mav_msg, &mav_status);
+                if (result == MAVLINK_FRAMING_OK) {
+                    process_mavlink_message(&mav_msg);
+                }
+            }
+        }
+
+        /* Connection timeout */
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (is_connected && (now - last_heartbeat_time > 3000)) {
+            is_connected = false;
+            add_log("Pixhawk connection lost!");
+        }
     }
 }
 
-extern "C" int app_main()
-{
-    /* Initialize NVS for WiFi */
+/* --- MAVLink heartbeat task: send heartbeat, RC override, auto-sequence --- */
+static void mavlink_heartbeat_task(void *pvParameters) {
+    ESP_LOGI(TAG, "Heartbeat task started (sysid=%d)", COMPANION_SYSID);
+
+    while (1) {
+        send_heartbeat();
+
+        /* Safety: auto-release RC if web client disconnected */
+        if (rc_override_active) {
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if ((now - rc_last_web_time) > RC_OVERRIDE_TIMEOUT_MS) {
+                rc_override_active = false;
+                rc_chan1 = 0; rc_chan2 = 0; rc_chan3 = 0; rc_chan4 = 0;
+                send_rc_override(0, 0, 0, 0);
+                add_log("RC SAFETY: auto-released (no web client)");
+            } else {
+                send_rc_override(rc_chan1, rc_chan2, rc_chan3, rc_chan4);
+            }
+        }
+
+        /* Tick auto-flight state machine at ~4 Hz */
+        auto_sequence_tick();
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+/* ========================== APP_MAIN ====================================== */
+
+extern "C" int app_main() {
+    ESP_LOGI(TAG, "=========================================");
+    ESP_LOGI(TAG, "  Drone Fire Detection + Pixhawk Control ");
+    ESP_LOGI(TAG, "=========================================");
+    ESP_LOGI(TAG, "Companion SysID: %d  Pixhawk SysID: %d", COMPANION_SYSID, PIXHAWK_SYSID);
+
+    /* NVS for WiFi */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -995,96 +1463,57 @@ extern "C" int app_main()
     }
     ESP_ERROR_CHECK(ret);
 
-    /* Create mutex for shared data */
+    /* Create mutexes */
     detection_mutex = xSemaphoreCreateMutex();
-    if (detection_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create mutex");
+    uart_mutex = xSemaphoreCreateMutex();
+    log_mutex = xSemaphoreCreateMutex();
+
+    if (!detection_mutex || !uart_mutex || !log_mutex) {
+        ESP_LOGE(TAG, "Failed to create mutexes");
         return -1;
     }
 
-    setup_led();
-    add_log("[System] Fire Detection System starting...");
+    add_log("[System] Starting...");
 
-    /* Initialize WiFi AP Mode */
+    /* Initialize MAVLink UART */
+    mavlink_status_init(&mav_status);
+    mav_uart_init();
+
+    /* Initialize WiFi AP */
     wifi_init_softap();
 
-    /* Initialize Edge Impulse sensors and commands */
-    dev = static_cast<EiDeviceESP32*>(EiDeviceESP32::get_device());
+    /* Initialize Edge Impulse */
+    dev = static_cast<EiDeviceESP32 *>(EiDeviceESP32::get_device());
+    ei_printf("Edge Impulse SDK initialized. Compiled %s %s\r\n", __DATE__, __TIME__);
+    add_log("[EI] SDK initialized");
 
-    ei_printf(
-        "Hello from Edge Impulse Device SDK.\r\n"
-        "Compiled on %s %s\r\n",
-        __DATE__,
-        __TIME__);
-    add_log("[EdgeImpulse] SDK initialized");
-
-    /* Setup the inertial sensor */
     if (ei_inertial_init() == false) {
-        ei_printf("Inertial sensor initialization failed\r\n");
-        add_log("[Warning] Inertial sensor failed");
-    } else {
-        add_log("[Sensor] Inertial sensor ready");
+        ei_printf("Inertial sensor init failed\r\n");
     }
-
-    /* Setup the analog sensor */
     if (ei_analog_sensor_init() == false) {
-        ei_printf("ADC sensor initialization failed\r\n");
-        add_log("[Warning] ADC sensor failed");
-    } else {
-        add_log("[Sensor] ADC sensor ready");
+        ei_printf("ADC sensor init failed\r\n");
     }
 
     at = ei_at_init(dev);
-    ei_printf("Type AT+HELP to see a list of commands.\r\n");
-    at->print_prompt();
-
     dev->set_state(eiStateFinished);
     add_log("[System] All systems initialized");
 
-    /* Create FreeRTOS tasks with proper priorities */
-    xTaskCreate(
-        serial_task,           // Task function
-        "serial_task",         // Task name
-        4096,                  // Stack size (bytes)
-        NULL,                  // Task parameters
-        5,                     // Priority (5 = high - critical)
-        NULL                   // Task handle
-    );
-    add_log("[Task] Serial task created (Priority: 5)");
+    /* Create FreeRTOS tasks */
+    xTaskCreate(serial_task,            "serial",   4096,  NULL, 5,  NULL);
+    xTaskCreate(inference_task,         "infer",    16384, NULL, 4,  NULL);
+    xTaskCreate(mavlink_rx_task,        "mav_rx",   4096,  NULL, 7,  NULL);
+    xTaskCreate(mavlink_heartbeat_task, "mav_hb",   4096,  NULL, 3,  NULL);
+    xTaskCreate(webserver_task,         "webserv",  8192,  NULL, 2,  NULL);
+    xTaskCreate(led_task,               "led",      2048,  NULL, 1,  NULL);
 
-    xTaskCreate(
-        webserver_task,        // Task function
-        "webserver_task",      // Task name
-        8192,                  // Stack size (bytes)
-        NULL,                  // Task parameters
-        3,                     // Priority (3 = medium)
-        NULL                   // Task handle
-    );
-    add_log("[Task] Web server task created (Priority: 3)");
+    add_log("[System] 6 tasks created, scheduler running");
 
-    xTaskCreate(
-        led_task,              // Task function
-        "led_task",            // Task name
-        2048,                  // Stack size (bytes)
-        NULL,                  // Task parameters
-        1,                     // Priority (1 = low)
-        NULL                   // Task handle
-    );
-    add_log("[Task] LED task created (Priority: 1)");
+    ESP_LOGI(TAG, "=========================================");
+    ESP_LOGI(TAG, "WiFi: %s / %s", WIFI_SSID, WIFI_PASS);
+    ESP_LOGI(TAG, "Web:  http://192.168.4.1");
+    ESP_LOGI(TAG, "MAV:  TX=%d RX=%d @ %d baud", MAV_TX_PIN, MAV_RX_PIN, MAV_BAUD_RATE);
+    ESP_LOGI(TAG, "=========================================");
 
-    xTaskCreate(
-        inference_task,        // Task function
-        "inference_task",      // Task name
-        16384,                 // Stack size (16KB for ML)
-        NULL,                  // Task parameters
-        4,                     // Priority (4 = high, below serial)
-        NULL                   // Task handle
-    );
-    add_log("[Task] Inference task created (Priority: 4)");
-    add_log("[System] FreeRTOS scheduler starting...");
-
-    /* Delete init task - FreeRTOS tasks now run */
     vTaskDelete(NULL);
-    
     return 0;
 }
