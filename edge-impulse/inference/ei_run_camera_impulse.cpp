@@ -47,6 +47,9 @@
 #include "ei_run_impulse.h"
 
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* External function to update web interface */
 extern void update_detection_data(uint32_t x, uint32_t y, uint32_t width, uint32_t height, float confidence, const char* label);
@@ -122,18 +125,31 @@ void ei_run_impulse(void)
 
     EiCameraESP32 *camera = static_cast<EiCameraESP32*>(EiCameraESP32::get_camera());
 
-    ei_printf("Taking photo...\n");
+    /* --- DIAGNOSTICS AREA 4: impulse loop timing --------------------------- */
+    int64_t impulse_t0 = esp_timer_get_time();
+    ei_printf("Taking photo... [heap=%u psram=%u core=%d]\n",
+              esp_get_free_heap_size(),
+              heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+              (int)xPortGetCoreID());
 
     if(camera->ei_camera_capture_jpeg(&jpeg_image, &jpeg_image_size) == false) {
-        ei_printf("ERR: Failed to take a snapshot!\n");
+        ei_printf("ERR: Failed to take a snapshot! [elapsed=%lld us]\n",
+                  esp_timer_get_time() - impulse_t0);
         return;
     }
 
+    ei_printf("[DBG] JPEG captured: %u bytes in %lld us\n",
+              jpeg_image_size, esp_timer_get_time() - impulse_t0);
+
     snapshot_buf = (uint8_t*)ei_malloc(snapshot_buf_size);
 
-    // check if allocation was successful
+    /* --- DIAGNOSTICS AREA 5: snapshot buffer allocation -------------------- */
     if(snapshot_buf == nullptr) {
-        ei_printf("ERR: Failed to allocate snapshot buffer!\n");
+        ei_printf("ERR: Failed to allocate snapshot_buf (%u bytes)! free_heap=%u free_psram=%u\n",
+                  snapshot_buf_size,
+                  esp_get_free_heap_size(),
+                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        ei_free(jpeg_image);
         return;
     }
 
@@ -255,7 +271,7 @@ void ei_start_impulse(bool continuous, bool debug, bool use_max_uart_speed)
 
     while(!ei_user_invoke_stop()) {
         ei_run_impulse();
-        ei_sleep(1);
+        ei_sleep(100);  // yield 100ms so IDLE task can reset watchdog between inference cycles
     }
 
     ei_stop_impulse();

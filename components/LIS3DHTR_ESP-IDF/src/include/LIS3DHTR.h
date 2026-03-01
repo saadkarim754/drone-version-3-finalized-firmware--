@@ -28,8 +28,15 @@
 
 #include <stdint.h>
 
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+/* On GOOUUU ESP32-S3-CAM, GPIO 4/5 are used by the camera SCCB bus.
+   Route LIS3DH to non-conflicting pins (device is optional on S3). */
+#define I2C_MASTER_SCL_IO           38      /*!< GPIO number used for I2C master clock (ESP32-S3) */
+#define I2C_MASTER_SDA_IO            2      /*!< GPIO number used for I2C master data  (ESP32-S3) */
+#else
 #define I2C_MASTER_SCL_IO           22      /*!< GPIO number used for I2C master clock */
 #define I2C_MASTER_SDA_IO           21      /*!< GPIO number used for I2C master data  */
+#endif
 #define I2C_MASTER_NUM              I2C_NUM_0                          /*!< I2C master i2c port number, the number of i2c peripheral interfaces available will depend on the chip */
 #define I2C_MASTER_FREQ_HZ          400000                     /*!< I2C master clock frequency */
 #define I2C_MASTER_TX_BUF_DISABLE   0                          /*!< I2C master doesn't need buffer */

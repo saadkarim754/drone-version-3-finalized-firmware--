@@ -19,7 +19,10 @@
 #ifdef CONFIG_IDF_TARGET_ESP32P4
 #define ARCH_ESP32_P4 1
 #endif
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+// When ESP_NN_USE_GENERIC_OPT_S3 is defined, skip S3 SIMD assembly (which
+// causes heap-metadata corruption) and fall through to the generic optimised
+// C kernels (_opt) instead.  Performance is comparable to ESP32 (~500 ms).
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && !defined(ESP_NN_USE_GENERIC_OPT_S3)
 #define ARCH_ESP32_S3 1
 #endif
 #ifdef CONFIG_IDF_TARGET_ESP32

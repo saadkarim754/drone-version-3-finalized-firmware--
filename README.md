@@ -1,51 +1,136 @@
-# Edge Impulse firmware for Espressif ESP32
+# Drone Fire Detection + Pixhawk Companion Computer
 
-Edge Impulse enables developers to create the next generation of intelligent device solutions with embedded Machine Learning. This repository contains the Edge Impulse firmware for the Espressif ESP32 based development boards, specifically ESP-EYE (ESP32) and FireBeetle Board (ESP32). These devicee supports Edge Impulse device features, including ingestion and inferencing.
+ESP32-CAM firmware combining **Edge Impulse FOMO fire detection** with a **MAVLink Pixhawk companion computer**. A single web dashboard at `http://192.168.4.1` provides live camera feed with AI fire detection overlay, drone arm/disarm/mode controls, RC override sliders, auto-flight sequence, and full telemetry.
 
-**Note: Do you just want to use this development board with Edge Impulse? No need to build this firmware. See the instructions [here](https://docs.edgeimpulse.com/docs/espressif-esp32) for a prebuilt firmware and instructions. Or, you can use the [data forwarder](https://docs.edgeimpulse.com/docs/cli-data-forwarder) to capture data from any sensor.**
+WiFi AP: **DroneFireDetect** / **drone12345**
+
+---
+
+## Supported Boards
+
+| Board | Chip | MAVLink UART | LED | Camera |
+|-------|------|-------------|-----|--------|
+| AI-Thinker ESP32-CAM | ESP32 | UART2 TX=13 RX=14 | GPIO 33 (active LOW) | AI-Thinker pinout |
+| GOOUUU ESP32-S3-CAM | ESP32-S3 | UART1 TX=47 RX=21 | GPIO 48 (active HIGH) | S3-CAM pinout |
+
+Board selection is **automatic** — the code uses `#if defined(CONFIG_IDF_TARGET_ESP32S3)` preprocessor checks, so the correct pins, UART, and LED polarity are chosen at compile time based on which chip you're building for.
+
+---
+
+## Switching Boards
+
+Two pre-configured `sdkconfig` files are provided. **You must copy the right one and clean before building.**
+
+### Build for AI-Thinker ESP32-CAM
+
+```bash
+copy sdkconfig.esp32 sdkconfig
+idf.py fullclean
+idf.py build
+idf.py -p COM5 flash monitor
+```
+
+### Build for GOOUUU ESP32-S3-CAM
+
+```bash
+copy sdkconfig.esp32s3 sdkconfig
+idf.py fullclean
+idf.py build
+idf.py -p COM5 flash monitor
+```
+
+> **Why `fullclean`?** The build directory caches the target chip. Switching between ESP32 and ESP32-S3 without cleaning will cause build errors. `fullclean` deletes the build folder so everything is regenerated from the new sdkconfig.
+
+> **Change `COM5`** to whatever port your board shows up as (check Device Manager).
+
+### First-time S3 setup (if `sdkconfig.esp32s3` doesn't exist yet)
+
+```bash
+copy sdkconfig sdkconfig.esp32            # backup current config
+idf.py set-target esp32s3                 # generates fresh S3 sdkconfig + cleans build
+idf.py menuconfig                         # configure these settings:
+```
+
+In menuconfig, set:
+- **Component config → ESP PSRAM → Support for external SPI-connected RAM** → Enable
+- **Component config → ESP PSRAM → SPI RAM config → Mode** → **Octal Mode (OPI)**
+- **Serial flasher config → Flash size** → **8MB** (or match your board)
+- **Partition Table → Custom partition CSV file** → `partitions.csv`
+
+Then save and exit, and backup the S3 config:
+
+```bash
+copy sdkconfig sdkconfig.esp32s3
+idf.py build
+```
+
+Now both configs are saved and you can switch between boards with just `copy` + `fullclean` + `build`.
+
+---
 
 ## Requirements
 
 ### Hardware
 
-- Espressif ESP32 based development boards, preferably ESP-EYE (ESP32) and FireBeetle Board (ESP32). Using with other boards is possible, but code modifications is needed. For more on that read **Using with other ESP32 boards**.
+- ESP32-CAM (AI-Thinker) or ESP32-S3-CAM (GOOUUU) with OV2640 camera
+- Pixhawk flight controller (ArduCopter) connected via UART
 
 ### Tools
-Install ESP IDF v5.1.1, following the instructions for your OS from [this page](https://docs.espressif.com/projects/esp-idf/en/v5.1.1/esp32/get-started/index.html#installation-step-by-step). You need this exact version - future versions might work, but not tested.
+Install ESP IDF v5.1.1, following the instructions for your OS from [this page](https://docs.espressif.com/projects/esp-idf/en/v5.1.1/esp32/get-started/index.html#installation-step-by-step).
 
 ### Building the application
-Then from the firmware folder execute:
+From the firmware folder, in an ESP-IDF terminal:
 ```bash
-get_idf
-clear && idf.py build
+idf.py build
 ```
-```get_idf``` is an alias for export.sh script that sets up ESP IDF environment variables. Read more about it [here](https://docs.espressif.com/projects/esp-idf/en/v4.4/esp32/get-started/index.html#step-4-set-up-the-environment-variables).
 
 ### Flash
 
-Connect the ESP32 board to your computer.
+Connect the board to your computer and run:
+```bash
+idf.py -p COM5 flash monitor
+```
 
-Run:
-   ```bash
-   idf.py -p /dev/ttyUSB0 flash monitor
-   ```
-
-Where ```/dev/ttyUSB0``` needs to be changed to actual port where ESP32 is connected on your system.
+Change `COM5` to your actual serial port.
 
 ### Serial connection
 
-Use screen, minicom or Serial monitor in Arduino IDE to set up a serial connection over USB. The following UART settings are used: 115200 baud, 8N1.
+115200 baud, 8N1.
 
-### Using with other ESP32 boards
+---
 
-ESP32 is a very popular chip both in a community projects and in industry, due to its high performance, low price and large amount of documentation/support available. There are other camera enabled development boards based on ESP32, which can use Edge Impulse firmware after applying certain changes, e.g.
+## Web Dashboard
 
-- AI-Thinker ESP-CAM
-- M5STACK ESP32 PSRAM Timer Camera X (OV3660)
-- M5STACK ESP32 Camera Module Development Board (OV2640)
+Connect to WiFi AP **DroneFireDetect** (password: **drone12345**), then open **http://192.168.4.1**.
 
-The pins used for camera connection on different development boards are not the same, therefore you will need to change the #define [here](https://github.com/edgeimpulse/firmware-espressif-esp32/blob/main/edge-impulse/ingestion-sdk-platform/sensors/ei_camera.h#L29) to fit your development board, compile and flash the firmware. Specifically for AI-Thinker ESP-CAM, since this board needs an external USB to TTL Serial Cable to upload the code/communicate with the board, the data transfer baud rate must be changed to 115200 [here](https://github.com/edgeimpulse/firmware-espressif-esp32/blob/main/edge-impulse/ingestion-sdk-platform/espressif_esp32/ei_device_espressif_esp32.h#35).
+Features:
+- **Status bar**: Connection, armed state, flight mode, battery voltage/percentage
+- **Camera feed**: Live MJPEG with fire detection bounding box overlay
+- **Controls**: Setup, Arm, Force Arm, Disarm, Flight Mode selector
+- **RC Override**: Throttle, Yaw, Pitch, Roll sliders with snap-back
+- **Auto Flight**: One-click takeoff sequence (GUIDED → ARM → Takeoff → Hover → LAND)
+- **Telemetry**: GPS, attitude, altitude, groundspeed, heading, climb rate
+- **Logs**: Scrolling event log
 
-The analog sensor and LIS3DH accelerometer can be used on any other development board without changes, as long as the interface pins are not changed. If I2C/ADC pins that accelerometer/analog sensor are connected to are different, from described in Sensors available section, you will need to [change the values](https://github.com/AIWintermuteAI/LIS3DHTR_ESP-IDF/blob/641bda8c3e4b706a2365fe87dd4d925f96ea3f8c/src/include/LIS3DHTR.h#L31) in LIS3DHTR component for ESP32, compile and flash it to your board.
+---
+
+## Project Structure
+
+```
+main/main.cpp                    ← Merged firmware (fire detection + companion)
+main/web-interface.c             ← Reference file (Pixhawk companion, not compiled)
+main/main.cpp.bak                ← Original fire-detection-only backup
+edge-impulse/                    ← EI platform code + inference engine
+edge-impulse-sdk/                ← Edge Impulse C++ SDK
+firmware-sdk/                    ← EI device library
+model-parameters/                ← FOMO model metadata
+tflite-model/                    ← Compiled TFLite model
+components/esp32-camera/         ← Camera driver
+components/mavespstm/            ← Lightweight MAVLink v2 library (header-only)
+components/LIS3DHTR_ESP-IDF/     ← Accelerometer driver
+sdkconfig.esp32                  ← Saved config for AI-Thinker ESP32-CAM
+sdkconfig.esp32s3                ← Saved config for GOOUUU ESP32-S3-CAM
+partitions.csv                   ← Custom partition table (3MB app)
+```
 
 Additionally, since Edge Impulse firmware is open-source and available to public, if you have made modifications/added new sensors capabilities, we encourage you to make a PR in firmware repository!

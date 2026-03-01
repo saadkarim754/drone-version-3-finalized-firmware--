@@ -38,15 +38,50 @@
 /* Include ----------------------------------------------------------------- */
 #include "firmware-sdk/ei_camera_interface.h"
 
-#define CAMERA_MODEL_AI_THINKER
+/*
+ * Board auto-selection based on ESP-IDF target chip.
+ * CONFIG_IDF_TARGET_ESP32S3 is defined automatically by sdkconfig when
+ * building for ESP32-S3.  Otherwise default to AI-Thinker (classic ESP32-CAM).
+ */
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define CAMERA_MODEL_ESP32S3_CAM
+#else
+  #define CAMERA_MODEL_AI_THINKER
+#endif
 
 /*
  *   Pin definitions for some common ESP-CAM modules
  *
- *   Defaults to ESP-EYE
+ *   Defaults to AI-Thinker for ESP32, ESP32-S3-CAM for ESP32-S3
  *
  */
-#if defined(CAMERA_MODEL_AI_THINKER)
+#if defined(CAMERA_MODEL_ESP32S3_CAM)
+  //
+  // GOOUUU / Generic ESP32-S3-CAM (N16R8 / N8R8)
+  // OV2640 camera with Octal PSRAM
+  //
+  #define PWDN_GPIO_NUM     -1
+  #define RESET_GPIO_NUM    -1
+  #define XCLK_GPIO_NUM     15
+  #define SIOD_GPIO_NUM      4
+  #define SIOC_GPIO_NUM      5
+  #define Y9_GPIO_NUM       16
+  #define Y8_GPIO_NUM       17
+  #define Y7_GPIO_NUM       18
+  #define Y6_GPIO_NUM       12
+  #define Y5_GPIO_NUM       10
+  #define Y4_GPIO_NUM        8
+  #define Y3_GPIO_NUM        9
+  #define Y2_GPIO_NUM       11
+  #define VSYNC_GPIO_NUM     6
+  #define HREF_GPIO_NUM      7
+  #define PCLK_GPIO_NUM     13
+  #define LED_PIN           48  // User LED (active HIGH)
+  #define LED_ON          HIGH
+  #define LED_OFF          LOW
+  // #define LAMP_PIN        -1
+
+#elif defined(CAMERA_MODEL_AI_THINKER)
   //
   // AI Thinker
   // https://github.com/SeeedDocument/forum_doc/raw/master/reg/ESP32_CAM_V1.6.pdf

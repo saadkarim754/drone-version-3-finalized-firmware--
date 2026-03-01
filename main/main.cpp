@@ -15,15 +15,19 @@
  *   - GPS, Barometer, Battery, Attitude, VFR HUD telemetry
  *   - Geofence safety (altitude + radius)
  *
- * Hardware:
- *   - ESP32-CAM (AI-Thinker or similar) with OV2640 camera
- *   - Pixhawk flight controller connected via UART
+ * Hardware (two boards supported, auto-detected at compile time):
  *
- * GPIO Assignment (adjust for your board):
- *   - GPIO 13 (TX) -> Pixhawk RX   (MAVLink UART)
- *   - GPIO 14 (RX) <- Pixhawk TX   (MAVLink UART)
- *   - GPIO 33      -> Onboard red LED (heartbeat / fire indicator)
- *   - Camera pins  -> Managed by esp32-camera driver
+ *   Board A: ESP32-CAM AI-Thinker   (CONFIG_IDF_TARGET_ESP32)
+ *     MAVLink UART2  TX=GPIO13  RX=GPIO14
+ *     LED GPIO 33 (active LOW)
+ *     Camera: standard AI-Thinker pinout
+ *
+ *   Board B: GOOUUU ESP32-S3-CAM    (CONFIG_IDF_TARGET_ESP32S3)
+ *     MAVLink UART1  TX=GPIO47  RX=GPIO21
+ *     LED GPIO 48 (active HIGH)
+ *     Camera: S3-CAM pinout (XCLK=15, SIOD=4, SIOC=5, etc.)
+ *
+ *   Both boards: Pixhawk flight controller connected via UART
  *
  * Configuration:
  *   - WiFi AP SSID: DroneFireDetect  Password: drone12345
@@ -58,6 +62,7 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "esp_camera.h"
+#include "esp_heap_caps.h"
 #include "img_converters.h"
 
 /* Edge Impulse headers */
@@ -67,6 +72,7 @@
 #include "ei_run_impulse.h"
 #include "ei_analogsensor.h"
 #include "ei_inertial_sensor.h"
+#include "ei_camera.h"
 
 /* MAVLink library (lightweight, header-only) */
 #include "mavespstm.h"
@@ -79,10 +85,20 @@
 #define WIFI_CHANNEL        1
 #define MAX_CONNECTIONS     4
 
-/* --- MAVLink UART to Pixhawk --- */
-#define MAV_UART_NUM        UART_NUM_2
-#define MAV_TX_PIN          GPIO_NUM_13
-#define MAV_RX_PIN          GPIO_NUM_14
+/* --- MAVLink UART to Pixhawk ---
+ * Board-specific GPIO selection:
+ *   ESP32 (AI-Thinker):  UART2  TX=13  RX=14   (free pins, camera uses others)
+ *   ESP32-S3 (GOOUUU):   UART1  TX=47  RX=21   (free pins, camera uses 4-18)
+ */
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define MAV_UART_NUM      UART_NUM_1
+  #define MAV_TX_PIN        GPIO_NUM_47
+  #define MAV_RX_PIN        GPIO_NUM_21
+#else
+  #define MAV_UART_NUM      UART_NUM_2
+  #define MAV_TX_PIN        GPIO_NUM_13
+  #define MAV_RX_PIN        GPIO_NUM_14
+#endif
 #define MAV_BAUD_RATE       57600
 #define UART_BUF_SIZE       1024
 
@@ -92,8 +108,17 @@
 #define PIXHAWK_SYSID       1
 #define PIXHAWK_COMPID      1
 
-/* --- Indicator LED (AI-Thinker onboard red LED, active LOW) --- */
-#define INDICATOR_LED_PIN   GPIO_NUM_33
+/* --- Indicator LED ---
+ *   ESP32 (AI-Thinker):  GPIO 33 onboard red LED, active LOW
+ *   ESP32-S3 (GOOUUU):   GPIO 48 user LED, active HIGH
+ */
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define INDICATOR_LED_PIN GPIO_NUM_48
+  #define LED_ACTIVE_LOW    0          /* active HIGH */
+#else
+  #define INDICATOR_LED_PIN GPIO_NUM_33
+  #define LED_ACTIVE_LOW    1          /* active LOW  */
+#endif
 
 /* --- Logging --- */
 #define LOG_BUFFER_SIZE     32
@@ -133,6 +158,143 @@ static void mavlink_heartbeat_task(void *pvParameters);
 static SemaphoreHandle_t detection_mutex = NULL;
 static SemaphoreHandle_t uart_mutex = NULL;
 static SemaphoreHandle_t log_mutex = NULL;
+
+/* --- Cached camera frame (written by camera_pump_task, read by inference & HTTP) --- */
+static SemaphoreHandle_t frame_cache_mutex = NULL;
+static uint8_t *cached_jpg_buf  = NULL;
+static size_t   cached_jpg_len  = 0;
+/* Signaled by camera_pump_task every time a fresh JPEG lands in the cache.
+ * Inference blocks on this instead of calling esp_camera_fb_get() directly. */
+SemaphoreHandle_t camera_ready_sem = NULL;
+
+/*
+ * Called from ei_camera.cpp after each JPEG capture so the HTTP
+ * frame_handler can serve the latest image without touching the
+ * camera hardware (avoids DMA contention when WiFi is active).
+ */
+extern "C" void camera_cache_frame(const uint8_t *buf, size_t len) {
+    if (!frame_cache_mutex || !buf || len == 0) return;
+    if (xSemaphoreTake(frame_cache_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (cached_jpg_buf) free(cached_jpg_buf);
+        // Force PSRAM to avoid fragmenting the precious internal SRAM for variable-size JPEGs
+        cached_jpg_buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+        if (cached_jpg_buf) {
+            memcpy(cached_jpg_buf, buf, len);
+            cached_jpg_len = len;
+        } else {
+            cached_jpg_len = 0;
+        }
+        xSemaphoreGive(frame_cache_mutex);
+    }
+}
+
+/*
+ * camera_get_cached_jpeg – called by ei_camera.cpp instead of esp_camera_fb_get().
+ * Returns a heap-allocated copy of the latest cached JPEG.  Caller must free().
+ */
+extern "C" bool camera_get_cached_jpeg(uint8_t **buf_out, size_t *len_out)
+{
+    if (!frame_cache_mutex || !buf_out || !len_out) return false;
+    if (xSemaphoreTake(frame_cache_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGE("cam_cache", "Mutex timeout in camera_get_cached_jpeg");
+        return false;
+    }
+    bool ok = false;
+    if (cached_jpg_buf && cached_jpg_len > 0) {
+        *buf_out = (uint8_t *)malloc(cached_jpg_len);
+        if (*buf_out) {
+            memcpy(*buf_out, cached_jpg_buf, cached_jpg_len);
+            *len_out = cached_jpg_len;
+            ok = true;
+        }
+    }
+    xSemaphoreGive(frame_cache_mutex);
+    return ok;
+}
+
+/* --------------------------------------------------------------------------
+ * camera_pump_task
+ * The ONLY task that ever calls esp_camera_fb_get() / esp_camera_fb_return().
+ * Runs at priority 15 on Core 1 (same core as the camera DMA ISR) so it
+ * services hardware frames immediately – inference never starves the pipeline.
+ * Inference blocks on camera_ready_sem then reads from the shared cache.
+ * -------------------------------------------------------------------------- */
+/*
+ * camera_reinit – deinit + reinit the camera hardware to recover from a stuck
+ * DMA state (typically caused by WiFi Block-ACK bursts starving the GDMA channel).
+ * Returns true on success.
+ */
+static bool camera_reinit(void)
+{
+    ESP_LOGW("cam_pump", ">>> Camera reinit: deinit...");
+    esp_camera_deinit();
+    vTaskDelay(pdMS_TO_TICKS(200));  /* let DMA / bus settle */
+
+    /* Re-read the current camera_config from ei_camera.cpp (it's a file-scope
+     * static, but esp_camera_init uses the last config).  We just call
+     * esp_camera_init with a minimal QQVGA config identical to what was used
+     * at first boot. */
+    ESP_LOGW("cam_pump", ">>> Camera reinit: init...");
+    EiCameraESP32 *cam = static_cast<EiCameraESP32*>(EiCameraESP32::get_camera());
+    /* init(96,96) selects QQVGA which is the smallest resolution */
+    bool ok = cam->init(96, 96);
+    if (ok) {
+        ESP_LOGW("cam_pump", ">>> Camera reinit SUCCESS");
+    } else {
+        ESP_LOGE("cam_pump", ">>> Camera reinit FAILED – will retry");
+    }
+    return ok;
+}
+
+static void camera_pump_task(void *pvParameters)
+{
+    ESP_LOGI("cam_pump", "Pump task started – waiting for camera init...");
+    /* Block until inference_task has called esp_camera_init() */
+    while (esp_camera_sensor_get() == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    ESP_LOGI("cam_pump", "Camera ready, pump running");
+
+    int consecutive_fails = 0;
+    const int REINIT_THRESHOLD = 3;  /* reinit camera after this many consecutive failures */
+
+    while (1) {
+        /* Yield briefly BEFORE fb_get so any pending WiFi DMA burst can finish
+         * first – this dramatically reduces the chance of bus collision. */
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            if (consecutive_fails > 0) {
+                ESP_LOGI("cam_pump", "Camera recovered after %d failures", consecutive_fails);
+            }
+            consecutive_fails = 0;
+            camera_cache_frame(fb->buf, fb->len);
+            esp_camera_fb_return(fb);
+            /* Notify inference that a fresh frame is in the cache. */
+            xSemaphoreGive(camera_ready_sem);
+        } else {
+            consecutive_fails++;
+            ESP_LOGW("cam_pump", "fb_get() returned NULL (%d consecutive)", consecutive_fails);
+
+            if (consecutive_fails >= REINIT_THRESHOLD) {
+                ESP_LOGE("cam_pump", "DMA appears stuck – reinitializing camera...");
+                if (camera_reinit()) {
+                    consecutive_fails = 0;
+                } else {
+                    /* reinit failed, wait longer before next attempt */
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+            } else {
+                /* Short back-off to let WiFi finish its burst */
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            continue;
+        }
+        /* ~15fps cap */
+        vTaskDelay(pdMS_TO_TICKS(55));
+    }
+}
 
 /* --- Fire Detection Data (shared with Edge Impulse inference) --- */
 typedef struct {
@@ -925,10 +1087,10 @@ static const char HTML_PAGE5[] =
 "ctx.strokeStyle='#f00';ctx.lineWidth=3;ctx.strokeRect(x,y,w,h);\n"
 "ctx.fillStyle='#f00';ctx.font='bold 14px Arial';\n"
 "ctx.fillText(d.label+' '+(d.confidence*100).toFixed(0)+'%',x,y>15?y-4:y+h+14);}\n"
-"fetching=false;setTimeout(fetchFrame,100);};\n"
+"fetching=false;setTimeout(fetchFrame,2000);};\n"
 "img.src='data:image/jpeg;base64,'+d.image;}\n"
-"else{fetching=false;setTimeout(fetchFrame,100);}\n"
-"}).catch(e=>{fetching=false;setTimeout(fetchFrame,500);});}\n"
+"else{fetching=false;setTimeout(fetchFrame,2000);}\n"
+"}).catch(e=>{fetching=false;setTimeout(fetchFrame,2000);});}\n"
 "\n"
 "function doSetup(){fetch('/api/setup',{method:'POST'});}\n"
 "function doArm(){fetch('/api/arm',{method:'POST'});}\n"
@@ -1070,43 +1232,52 @@ static size_t base64_encode(const uint8_t *src, size_t src_len, char *dst, size_
 
 /* --- Camera frame + detection JSON --- */
 static esp_err_t frame_handler(httpd_req_t *req) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Camera capture failed");
+    /*
+     * Serve the last JPEG cached by the inference task instead of calling
+     * esp_camera_fb_get() here.  This avoids DMA contention between the
+     * inference capture and the HTTP handler when WiFi traffic is active.
+     */
+    uint8_t *jpg_copy = NULL;
+    size_t   jpg_len  = 0;
+
+    if (frame_cache_mutex && xSemaphoreTake(frame_cache_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        if (cached_jpg_buf && cached_jpg_len) {
+            jpg_copy = (uint8_t *)heap_caps_malloc(cached_jpg_len, MALLOC_CAP_SPIRAM);
+            if (jpg_copy) {
+                memcpy(jpg_copy, cached_jpg_buf, cached_jpg_len);
+                jpg_len = cached_jpg_len;
+                ESP_LOGD("frame_h", "[DBG AREA 7] Serving cached frame: %u bytes", (unsigned)jpg_len);
+            } else {
+                ESP_LOGE("frame_h", "[DBG AREA 7] heap_caps_malloc(%u, SPIRAM) FAILED – free_psram=%u",
+                         (unsigned)cached_jpg_len, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            }
+        } else {
+            ESP_LOGW("frame_h", "[DBG AREA 7] Cache EMPTY when HTTP requested frame (buf=%p len=%u)",
+                     (void*)cached_jpg_buf, (unsigned)cached_jpg_len);
+        }
+        xSemaphoreGive(frame_cache_mutex);
+    } else {
+        ESP_LOGE("frame_h", "[DBG AREA 7] frame_cache_mutex TIMEOUT in frame_handler – inference holding lock?");
+    }
+
+    if (!jpg_copy) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No frame available yet");
         return ESP_FAIL;
     }
 
-    uint8_t *jpg_buf = NULL;
-    size_t jpg_len = 0;
-    bool need_free = false;
-
-    if (fb->format != PIXFORMAT_JPEG) {
-        if (!frame2jpg(fb, 80, &jpg_buf, &jpg_len)) {
-            esp_camera_fb_return(fb);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JPEG failed");
-            return ESP_FAIL;
-        }
-        need_free = true;
-    } else {
-        jpg_buf = fb->buf;
-        jpg_len = fb->len;
-    }
-
     size_t b64_len = ((jpg_len + 2) / 3) * 4 + 1;
-    char *b64_buf = (char *)malloc(b64_len);
+    char *b64_buf = (char *)heap_caps_malloc(b64_len, MALLOC_CAP_SPIRAM);
     if (!b64_buf) {
-        if (need_free) free(jpg_buf);
-        esp_camera_fb_return(fb);
+        free(jpg_copy);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
 
-    base64_encode(jpg_buf, jpg_len, b64_buf, b64_len);
-    if (need_free) free(jpg_buf);
-    esp_camera_fb_return(fb);
+    base64_encode(jpg_copy, jpg_len, b64_buf, b64_len);
+    free(jpg_copy);
 
     size_t json_size = b64_len + 256;
-    char *json = (char *)malloc(json_size);
+    char *json = (char *)heap_caps_malloc(json_size, MALLOC_CAP_SPIRAM);
     if (!json) {
         free(b64_buf);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
@@ -1332,7 +1503,7 @@ void serial_task(void *pvParameters) {
             at->handle(data);
             data = ei_get_serial_byte();
         }
-        vTaskDelay(1 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(100)); /* yield to prevent watchdog timeout */
     }
 }
 
@@ -1346,7 +1517,11 @@ void led_task(void *pvParameters) {
     gpio_pad_select_gpio(INDICATOR_LED_PIN);
 #endif
     gpio_set_direction(INDICATOR_LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(INDICATOR_LED_PIN, 1); /* Active LOW: OFF */
+    gpio_set_level(INDICATOR_LED_PIN, LED_ACTIVE_LOW ? 1 : 0); /* OFF */
+
+    /* LED helper: respects active-high vs active-low boards */
+    #define LED_ON_LEVEL   (LED_ACTIVE_LOW ? 0 : 1)
+    #define LED_OFF_LEVEL  (LED_ACTIVE_LOW ? 1 : 0)
 
     while (1) {
         led_state = !led_state;
@@ -1358,13 +1533,12 @@ void led_task(void *pvParameters) {
             xSemaphoreGive(detection_mutex);
         }
 
-        /* Active LOW on AI-Thinker: 0 = ON, 1 = OFF */
         if (fire) {
-            gpio_set_level(INDICATOR_LED_PIN, led_state ? 0 : 1); /* Fast blink */
+            gpio_set_level(INDICATOR_LED_PIN, led_state ? LED_ON_LEVEL : LED_OFF_LEVEL);
         } else if (is_connected) {
-            gpio_set_level(INDICATOR_LED_PIN, led_state ? 0 : 1); /* Slow blink */
+            gpio_set_level(INDICATOR_LED_PIN, led_state ? LED_ON_LEVEL : LED_OFF_LEVEL);
         } else {
-            gpio_set_level(INDICATOR_LED_PIN, 1); /* OFF when disconnected */
+            gpio_set_level(INDICATOR_LED_PIN, LED_OFF_LEVEL);
         }
 
         vTaskDelay(fire ? 200 / portTICK_PERIOD_MS : 1000 / portTICK_PERIOD_MS);
@@ -1467,9 +1641,11 @@ extern "C" int app_main() {
     detection_mutex = xSemaphoreCreateMutex();
     uart_mutex = xSemaphoreCreateMutex();
     log_mutex = xSemaphoreCreateMutex();
+    frame_cache_mutex = xSemaphoreCreateMutex();
+    camera_ready_sem  = xSemaphoreCreateBinary();
 
-    if (!detection_mutex || !uart_mutex || !log_mutex) {
-        ESP_LOGE(TAG, "Failed to create mutexes");
+    if (!detection_mutex || !uart_mutex || !log_mutex || !frame_cache_mutex || !camera_ready_sem) {
+        ESP_LOGE(TAG, "Failed to create mutexes/semaphores");
         return -1;
     }
 
@@ -1487,9 +1663,11 @@ extern "C" int app_main() {
     ei_printf("Edge Impulse SDK initialized. Compiled %s %s\r\n", __DATE__, __TIME__);
     add_log("[EI] SDK initialized");
 
-    if (ei_inertial_init() == false) {
-        ei_printf("Inertial sensor init failed\r\n");
-    }
+    /* Inertial sensor (LIS3DHTR) not present on this board – skip init
+     * to avoid the noisy i2c_set_pin / "Failed to connect" errors. */
+    // if (ei_inertial_init() == false) {
+    //     ei_printf("Inertial sensor init failed\r\n");
+    // }
     if (ei_analog_sensor_init() == false) {
         ei_printf("ADC sensor init failed\r\n");
     }
@@ -1498,13 +1676,35 @@ extern "C" int app_main() {
     dev->set_state(eiStateFinished);
     add_log("[System] All systems initialized");
 
-    /* Create FreeRTOS tasks */
-    xTaskCreate(serial_task,            "serial",   4096,  NULL, 5,  NULL);
-    xTaskCreate(inference_task,         "infer",    16384, NULL, 4,  NULL);
-    xTaskCreate(mavlink_rx_task,        "mav_rx",   4096,  NULL, 7,  NULL);
-    xTaskCreate(mavlink_heartbeat_task, "mav_hb",   4096,  NULL, 3,  NULL);
-    xTaskCreate(webserver_task,         "webserv",  8192,  NULL, 2,  NULL);
-    xTaskCreate(led_task,               "led",      2048,  NULL, 1,  NULL);
+    /* Create FreeRTOS tasks 
+     * IMPORTANT: Pin heavy tasks to Core 1 (APP_CPU). WiFi & LwIP run on Core 0.
+     * Splitting them prevents severe DMA/IRQ starvation that causes camera crash. 
+     */
+    /*
+     * Core Assignment:
+     *  Core 0: Wi-Fi (prio 23), lwIP, webserver_task, mavlink tasks
+     *          HTTP/TCP work co-located with Wi-Fi to share the same bus context.
+     *
+     *  Core 1: inference_task ONLY (+ camera ISR auto-registered here)
+     *          esp_camera_init() is called from inference_task, which causes the
+     *          LCD_CAM DMA interrupt to be registered to Core 1.  Keeping inference
+     *          on Core 1 ensures Wi-Fi's block-ACK bursts on Core 0 can NEVER
+     *          starve the camera interrupt, preventing the 4s 'Failed to get the
+     *          frame on time' timeout.
+     */
+    /* Core 1: camera_pump_task (prio 15) + inference_task (prio 4)
+     *   camera_pump_task owns ALL hardware fb_get/fb_return calls.
+     *   Its high priority guarantees DMA frames are serviced instantly,
+     *   even during the 620ms inference computation window.
+     *   inference_task blocks on camera_ready_sem (never touches hw).
+     * Core 0: Wi-Fi (prio 23) + all network/serial tasks. */
+    xTaskCreatePinnedToCore(camera_pump_task,       "cam_pump", 4096,  NULL, 15, NULL, 1);
+    xTaskCreatePinnedToCore(inference_task,         "infer",    16384, NULL, 4,  NULL, 1);
+    xTaskCreatePinnedToCore(serial_task,            "serial",   4096,  NULL, 5,  NULL, 0);
+    xTaskCreatePinnedToCore(mavlink_rx_task,        "mav_rx",   4096,  NULL, 7,  NULL, 0);
+    xTaskCreatePinnedToCore(mavlink_heartbeat_task, "mav_hb",   4096,  NULL, 3,  NULL, 0);
+    xTaskCreatePinnedToCore(webserver_task,         "webserv",  8192,  NULL, 2,  NULL, 0);
+    xTaskCreatePinnedToCore(led_task,               "led",      2048,  NULL, 1,  NULL, 0);
 
     add_log("[System] 6 tasks created, scheduler running");
 

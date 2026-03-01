@@ -48,6 +48,15 @@
 
 #include "esp_camera.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+
+/* Called from main.cpp – caches the latest JPEG for the HTTP frame_handler
+   so the web interface never needs to touch the camera hardware directly. */
+extern "C" void camera_cache_frame(const uint8_t *buf, size_t len);
+extern "C" bool camera_get_cached_jpeg(uint8_t **buf_out, size_t *len_out);
 
 static const char *TAG = "CameraDriver";
 
@@ -71,6 +80,7 @@ static camera_config_t camera_config = {
     .pin_pclk = PCLK_GPIO_NUM,
 
     //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
+    // 20MHz is required for reliable OV2640 JPEG encoder operation. 16MHz causes NO-SOI.
     .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
@@ -78,10 +88,15 @@ static camera_config_t camera_config = {
     .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
     .frame_size = FRAMESIZE_QVGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
 
-    .jpeg_quality = 20, //0-63 lower number means higher quality
-    .fb_count = 4,       //if more than one, i2s runs in continuous mode. Use only with JPEG
-    .fb_location = CAMERA_FB_IN_PSRAM,
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+    .jpeg_quality = 12, //0-63 lower number means higher quality; 12 = good quality, small JPEG
+    .fb_count = 1,       // Single buffer + GRAB_WHEN_EMPTY: DMA only runs when we request a
+                         // frame, minimising continuous bus contention with WiFi.
+    .fb_location = CAMERA_FB_IN_DRAM, // Internal SRAM for DMA target – camera DMA uses the
+                                      // internal AHB bus, WiFi DMA also uses AHB but camera
+                                      // JPEG at QQVGA is only ~2KB so transfers are very short.
+                                      // PSRAM is worse because WiFi + camera BOTH fight for
+                                      // the MSPI bus when SPIRAM is enabled.
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY, // DMA only captures when fb_get() is called.
     .sccb_i2c_port = 0,
 };
 
@@ -225,23 +240,35 @@ bool EiCameraESP32::ei_camera_capture_rgb888_packed_big_endian(
 
 bool EiCameraESP32::ei_camera_capture_jpeg(uint8_t **image, uint32_t *image_size)
 {
-    camera_fb_t *fb = esp_camera_fb_get();
+    /* Never call esp_camera_fb_get() here.
+     * camera_pump_task (main.cpp, prio 15, Core 1) exclusively owns the hardware
+     * pipeline.  We block on camera_ready_sem until a fresh JPEG is cached.
+     */
+    extern SemaphoreHandle_t camera_ready_sem;
 
-    if (!fb) {
-        ei_printf("ERR: Camera capture failed\n");
+    /* --- DIAGNOSTICS AREA 1 --- */
+    ESP_LOGW(TAG, "[DBG] capture_jpeg called: core=%d free_heap=%u free_psram=%u free_internal=%u",
+             (int)xPortGetCoreID(),
+             esp_get_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    /* Block until camera_pump_task delivers a fresh frame (max 2s) */
+    if (xSemaphoreTake(camera_ready_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "[DBG] Timed out waiting for camera_ready_sem – pump task stalled?");
         return false;
     }
 
-    ESP_LOGD(TAG, "fb res %d %d \n", fb->width, fb->height);
+    int64_t t0 = esp_timer_get_time();
+    size_t len = 0;
+    if (!camera_get_cached_jpeg(image, &len)) {
+        ESP_LOGE(TAG, "[DBG] camera_get_cached_jpeg failed – cache empty or malloc failed");
+        return false;
+    }
 
-    *image = nullptr;
-    *image = (uint8_t*)ei_malloc(fb->len);
-
-    memcpy(*image, fb->buf, fb->len);
-    memcpy(image_size, &fb->len, sizeof(uint32_t));
-
-    esp_camera_fb_return(fb);
-
+    *image_size = (uint32_t)len;
+    ESP_LOGW(TAG, "[DBG] Got cached JPEG: %u bytes in %lld us",
+             (unsigned)len, (esp_timer_get_time() - t0));
     return true;
 }
 

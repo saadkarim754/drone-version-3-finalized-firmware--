@@ -53,10 +53,17 @@
 #include <freertos/timers.h>
 
 /* Constants --------------------------------------------------------------- */
+#if CONFIG_IDF_TARGET_ESP32S3
+#define EI_RED_LED_OFF      gpio_set_level(GPIO_NUM_48, 0);
+#define EI_WHITE_LED_OFF    gpio_set_level(GPIO_NUM_48, 0);
+#define EI_RED_LED_ON       gpio_set_level(GPIO_NUM_48, 1);
+#define EI_WHITE_LED_ON     gpio_set_level(GPIO_NUM_48, 1);
+#else
 #define EI_RED_LED_OFF      gpio_set_level(GPIO_NUM_21, 0);
 #define EI_WHITE_LED_OFF    gpio_set_level(GPIO_NUM_22, 0);
-#define EI_RED_LED_ON     gpio_set_level(GPIO_NUM_21, 1);
-#define EI_WHITE_LED_ON    gpio_set_level(GPIO_NUM_22, 1);
+#define EI_RED_LED_ON       gpio_set_level(GPIO_NUM_21, 1);
+#define EI_WHITE_LED_ON     gpio_set_level(GPIO_NUM_22, 1);
+#endif
 
 /** Global objects */
 TimerHandle_t fusion_timer;

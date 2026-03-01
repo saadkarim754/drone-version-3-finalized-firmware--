@@ -50,6 +50,9 @@ static const adc_bits_width_t width = ADC_WIDTH_BIT_12;
 #elif CONFIG_IDF_TARGET_ESP32S2
 static const adc_channel_t channel = ADC_CHANNEL_6;     // GPIO7 if ADC1, GPIO17 if ADC2
 static const adc_bits_width_t width = ADC_WIDTH_BIT_13;
+#elif CONFIG_IDF_TARGET_ESP32S3
+static const adc_channel_t channel = ADC_CHANNEL_6;     // GPIO7 if ADC1
+static const adc_bits_width_t width = ADC_WIDTH_BIT_12;
 #endif
 static const adc_atten_t atten = ADC_ATTEN_DB_0;
 static const adc_unit_t unit = ADC_UNIT_1;
