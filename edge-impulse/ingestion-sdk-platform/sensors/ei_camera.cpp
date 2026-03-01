@@ -57,6 +57,7 @@
    so the web interface never needs to touch the camera hardware directly. */
 extern "C" void camera_cache_frame(const uint8_t *buf, size_t len);
 extern "C" bool camera_get_cached_jpeg(uint8_t **buf_out, size_t *len_out);
+extern "C" uint32_t camera_get_frame_id(void);
 
 static const char *TAG = "CameraDriver";
 
@@ -183,18 +184,10 @@ bool EiCameraESP32::init(uint16_t width, uint16_t height)
     s->set_hmirror(s, 1);
     s->set_awb_gain(s, 1);
 
-    // camera warm-up to avoid wrong WB
-    ei_sleep(10);
-    for (uint8_t i = 0; i < 7; i++) {
-        camera_fb_t *fb = esp_camera_fb_get();
-
-        if (!fb) {
-            ei_printf("ERR: Camera capture failed during warm-up \n");
-            return false;
-    }
-
-    esp_camera_fb_return(fb);
-    }
+    /* No warm-up loop here — the camera_pump_task (main.cpp) takes over
+     * fb_get/fb_return exclusively once esp_camera_init() returns.
+     * Running warm-up here with fb_count=1 races with the pump task. */
+    ei_sleep(100);  /* brief settle for AWB */
 
     return true;
 }
@@ -240,34 +233,32 @@ bool EiCameraESP32::ei_camera_capture_rgb888_packed_big_endian(
 
 bool EiCameraESP32::ei_camera_capture_jpeg(uint8_t **image, uint32_t *image_size)
 {
-    /* Never call esp_camera_fb_get() here.
-     * camera_pump_task (main.cpp, prio 15, Core 1) exclusively owns the hardware
-     * pipeline.  We block on camera_ready_sem until a fresh JPEG is cached.
-     */
-    extern SemaphoreHandle_t camera_ready_sem;
-
-    /* --- DIAGNOSTICS AREA 1 --- */
-    ESP_LOGW(TAG, "[DBG] capture_jpeg called: core=%d free_heap=%u free_psram=%u free_internal=%u",
-             (int)xPortGetCoreID(),
-             esp_get_free_heap_size(),
-             heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-
-    /* Block until camera_pump_task delivers a fresh frame (max 2s) */
-    if (xSemaphoreTake(camera_ready_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "[DBG] Timed out waiting for camera_ready_sem – pump task stalled?");
-        return false;
-    }
+    /* The camera_pump_task continuously fills the shared cache at ~30fps.
+     * We just grab the latest frame.  No need to block on a semaphore –
+     * there's almost always a fresh frame ready.  If the cache is empty
+     * (pump still starting or recovering from WiFi-induced reinit), we
+     * poll briefly. */
 
     int64_t t0 = esp_timer_get_time();
     size_t len = 0;
-    if (!camera_get_cached_jpeg(image, &len)) {
-        ESP_LOGE(TAG, "[DBG] camera_get_cached_jpeg failed – cache empty or malloc failed");
+    bool got_frame = false;
+
+    /* Poll for up to 3 seconds (pump reinit takes ~300ms worst case) */
+    for (int attempt = 0; attempt < 60; attempt++) {
+        if (camera_get_cached_jpeg(image, &len)) {
+            got_frame = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (!got_frame) {
+        ESP_LOGE(TAG, "[DBG] No cached frame available after 3s – pump task dead?");
         return false;
     }
 
     *image_size = (uint32_t)len;
-    ESP_LOGW(TAG, "[DBG] Got cached JPEG: %u bytes in %lld us",
+    ESP_LOGI(TAG, "Got JPEG: %u bytes in %lld us",
              (unsigned)len, (esp_timer_get_time() - t0));
     return true;
 }

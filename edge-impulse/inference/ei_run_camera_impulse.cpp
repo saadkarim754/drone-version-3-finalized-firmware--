@@ -125,21 +125,13 @@ void ei_run_impulse(void)
 
     EiCameraESP32 *camera = static_cast<EiCameraESP32*>(EiCameraESP32::get_camera());
 
-    /* --- DIAGNOSTICS AREA 4: impulse loop timing --------------------------- */
     int64_t impulse_t0 = esp_timer_get_time();
-    ei_printf("Taking photo... [heap=%u psram=%u core=%d]\n",
-              esp_get_free_heap_size(),
-              heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-              (int)xPortGetCoreID());
 
     if(camera->ei_camera_capture_jpeg(&jpeg_image, &jpeg_image_size) == false) {
-        ei_printf("ERR: Failed to take a snapshot! [elapsed=%lld us]\n",
+        ei_printf("ERR: Failed to get frame! [elapsed=%lld us]\n",
                   esp_timer_get_time() - impulse_t0);
         return;
     }
-
-    ei_printf("[DBG] JPEG captured: %u bytes in %lld us\n",
-              jpeg_image_size, esp_timer_get_time() - impulse_t0);
 
     snapshot_buf = (uint8_t*)ei_malloc(snapshot_buf_size);
 
@@ -271,7 +263,7 @@ void ei_start_impulse(bool continuous, bool debug, bool use_max_uart_speed)
 
     while(!ei_user_invoke_stop()) {
         ei_run_impulse();
-        ei_sleep(100);  // yield 100ms so IDLE task can reset watchdog between inference cycles
+        ei_sleep(10);  // yield 10ms so IDLE task on Core 1 can feed the watchdog
     }
 
     ei_stop_impulse();

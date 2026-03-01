@@ -163,6 +163,7 @@ static SemaphoreHandle_t log_mutex = NULL;
 static SemaphoreHandle_t frame_cache_mutex = NULL;
 static uint8_t *cached_jpg_buf  = NULL;
 static size_t   cached_jpg_len  = 0;
+static volatile uint32_t cached_frame_id = 0;  /* incremented every time a new frame lands */
 /* Signaled by camera_pump_task every time a fresh JPEG lands in the cache.
  * Inference blocks on this instead of calling esp_camera_fb_get() directly. */
 SemaphoreHandle_t camera_ready_sem = NULL;
@@ -174,13 +175,14 @@ SemaphoreHandle_t camera_ready_sem = NULL;
  */
 extern "C" void camera_cache_frame(const uint8_t *buf, size_t len) {
     if (!frame_cache_mutex || !buf || len == 0) return;
-    if (xSemaphoreTake(frame_cache_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (xSemaphoreTake(frame_cache_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         if (cached_jpg_buf) free(cached_jpg_buf);
         // Force PSRAM to avoid fragmenting the precious internal SRAM for variable-size JPEGs
         cached_jpg_buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
         if (cached_jpg_buf) {
             memcpy(cached_jpg_buf, buf, len);
             cached_jpg_len = len;
+            cached_frame_id++;  /* atomic-ish on Xtensa single-word write */
         } else {
             cached_jpg_len = 0;
         }
@@ -189,13 +191,14 @@ extern "C" void camera_cache_frame(const uint8_t *buf, size_t len) {
 }
 
 /*
- * camera_get_cached_jpeg – called by ei_camera.cpp instead of esp_camera_fb_get().
+ * camera_get_cached_jpeg – called by ei_camera.cpp.
  * Returns a heap-allocated copy of the latest cached JPEG.  Caller must free().
+ * Also returns the frame_id so callers can detect stale frames.
  */
 extern "C" bool camera_get_cached_jpeg(uint8_t **buf_out, size_t *len_out)
 {
     if (!frame_cache_mutex || !buf_out || !len_out) return false;
-    if (xSemaphoreTake(frame_cache_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    if (xSemaphoreTake(frame_cache_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGE("cam_cache", "Mutex timeout in camera_get_cached_jpeg");
         return false;
     }
@@ -210,6 +213,12 @@ extern "C" bool camera_get_cached_jpeg(uint8_t **buf_out, size_t *len_out)
     }
     xSemaphoreGive(frame_cache_mutex);
     return ok;
+}
+
+/* Return the current frame counter (lock-free read) */
+extern "C" uint32_t camera_get_frame_id(void)
+{
+    return cached_frame_id;
 }
 
 /* --------------------------------------------------------------------------
@@ -259,9 +268,8 @@ static void camera_pump_task(void *pvParameters)
     const int REINIT_THRESHOLD = 3;  /* reinit camera after this many consecutive failures */
 
     while (1) {
-        /* Yield briefly BEFORE fb_get so any pending WiFi DMA burst can finish
-         * first – this dramatically reduces the chance of bus collision. */
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* Brief yield so WiFi DMA bursts can finish before we claim the bus */
+        vTaskDelay(pdMS_TO_TICKS(5));
 
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
@@ -271,7 +279,7 @@ static void camera_pump_task(void *pvParameters)
             consecutive_fails = 0;
             camera_cache_frame(fb->buf, fb->len);
             esp_camera_fb_return(fb);
-            /* Notify inference that a fresh frame is in the cache. */
+            /* Also signal semaphore for any legacy code that still waits on it */
             xSemaphoreGive(camera_ready_sem);
         } else {
             consecutive_fails++;
@@ -291,8 +299,8 @@ static void camera_pump_task(void *pvParameters)
             }
             continue;
         }
-        /* ~15fps cap */
-        vTaskDelay(pdMS_TO_TICKS(55));
+        /* ~30fps cap */
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
 
@@ -1087,10 +1095,11 @@ static const char HTML_PAGE5[] =
 "ctx.strokeStyle='#f00';ctx.lineWidth=3;ctx.strokeRect(x,y,w,h);\n"
 "ctx.fillStyle='#f00';ctx.font='bold 14px Arial';\n"
 "ctx.fillText(d.label+' '+(d.confidence*100).toFixed(0)+'%',x,y>15?y-4:y+h+14);}\n"
-"fetching=false;setTimeout(fetchFrame,2000);};\n"
+"fc++;var now=Date.now();if(now-ft>=1000){document.title='FPS:'+fc;fc=0;ft=now;}\n"
+"fetching=false;setTimeout(fetchFrame,100);};\n"
 "img.src='data:image/jpeg;base64,'+d.image;}\n"
-"else{fetching=false;setTimeout(fetchFrame,2000);}\n"
-"}).catch(e=>{fetching=false;setTimeout(fetchFrame,2000);});}\n"
+"else{fetching=false;setTimeout(fetchFrame,100);}\n"
+"}).catch(e=>{fetching=false;setTimeout(fetchFrame,500);});}\n"
 "\n"
 "function doSetup(){fetch('/api/setup',{method:'POST'});}\n"
 "function doArm(){fetch('/api/arm',{method:'POST'});}\n"
@@ -1126,7 +1135,8 @@ static const char HTML_PAGE5[] =
 "document.getElementById(id).addEventListener('mouseup',snap);\n"
 "document.getElementById(id).addEventListener('touchend',snap);});\n"
 "\n"
-"function tc(el){el.parentElement.classList.toggle('cl');}\n"
+"function tc(el){el.parentElement.classList.toggle('cl');}"
+"var fc=0,ft=Date.now();"
 "setInterval(update,500);update();fetchFrame();\n"
 "</script></body></html>";
 
