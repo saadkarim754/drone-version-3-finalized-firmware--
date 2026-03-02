@@ -64,6 +64,7 @@
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 #include "img_converters.h"
+#include "driver/rmt_tx.h"     /* WS2812 addressable LED via RMT peripheral */
 
 /* Edge Impulse headers */
 #include "ei_device_espressif_esp32.h"
@@ -329,6 +330,13 @@ typedef struct {
 
 static detection_data_t latest_detection = {0};
 static bool alarm_active = false;
+
+/* --- Fire consistency tracker (LED alert requires 5s sustained detection) --- */
+#define FIRE_CONSISTENCY_CHECKS  25   /* 25 checks at 200ms = 5 seconds */
+static int fire_positive_count = 0;        /* rolling count of consecutive fire-positive polls */
+static bool fire_confirmed = false;        /* set true once FIRE_CONSISTENCY_CHECKS consecutive positives */
+static uint32_t fire_alert_start_ms = 0;   /* timestamp when fire alert LED sequence began */
+#define FIRE_ALERT_DURATION_MS   5000      /* how long the fire LED sequence plays */
 
 /* --- Camera settings --- */
 static bool camera_vflip = false;
@@ -1530,40 +1538,234 @@ void serial_task(void *pvParameters) {
 }
 
 /* --- LED indicator task --- */
+/* ==========================================================================
+ * WS2812 Addressable RGB LED Driver via RMT (ESP-IDF v5.x)
+ *
+ * The GOOUUU ESP32-S3-CAM has a WS2812B on GPIO 48.
+ * We use a single RMT TX channel with a custom byte encoder.
+ *
+ * LED State Priority (highest first):
+ *   1. FIRE_ALERT    – confirmed fire (5s consistent) → red/orange flash 5s
+ *   2. ARMED         – drone armed                   → solid blue
+ *   3. GPS_STABILIZE – GPS data + STABILIZE mode      → solid green
+ *   4. GPS_OK        – GPS data, other mode            → dim cyan
+ *   5. CONNECTED     – Pixhawk heartbeat               → dim white pulse
+ *   6. IDLE          – no connection                   → slow magenta breathe
+ * ========================================================================== */
+
+/* WS2812 timing (in RMT ticks at 10 MHz = 100ns per tick) */
+#define WS_T0H  3   /* 300ns */
+#define WS_T0L  9   /* 900ns */
+#define WS_T1H  9   /* 900ns */
+#define WS_T1L  3   /* 300ns */
+#define WS_RST  280 /* 28us reset – exceeds 50us with code overhead */
+
+typedef struct {
+    rmt_encoder_t base;
+    rmt_encoder_t *bytes_encoder;
+    rmt_encoder_t *copy_encoder;
+    int state;
+    rmt_symbol_word_t reset_code;
+} ws2812_encoder_t;
+
+static size_t ws2812_encode(rmt_encoder_t *encoder, rmt_channel_handle_t channel,
+                            const void *primary_data, size_t data_size,
+                            rmt_encode_state_t *ret_state)
+{
+    ws2812_encoder_t *ws = __containerof(encoder, ws2812_encoder_t, base);
+    rmt_encode_state_t session_state = RMT_ENCODING_RESET;
+    size_t encoded_symbols = 0;
+
+    switch (ws->state) {
+    case 0: { /* encode pixel data (GRB bytes) */
+        size_t n = ws->bytes_encoder->encode(ws->bytes_encoder, channel,
+                                              primary_data, data_size, &session_state);
+        encoded_symbols += n;
+        if (session_state & RMT_ENCODING_COMPLETE) {
+            ws->state = 1; /* move to reset code */
+        }
+        if (session_state & RMT_ENCODING_MEM_FULL) {
+            *ret_state = (rmt_encode_state_t)RMT_ENCODING_MEM_FULL;
+            return encoded_symbols;
+        }
+    } /* fall through */
+    case 1: { /* send reset code */
+        size_t n = ws->copy_encoder->encode(ws->copy_encoder, channel,
+                                             &ws->reset_code, sizeof(ws->reset_code),
+                                             &session_state);
+        encoded_symbols += n;
+        if (session_state & RMT_ENCODING_COMPLETE) {
+            ws->state = 0; /* back to initial */
+            *ret_state = (rmt_encode_state_t)RMT_ENCODING_COMPLETE;
+        }
+        if (session_state & RMT_ENCODING_MEM_FULL) {
+            *ret_state = (rmt_encode_state_t)RMT_ENCODING_MEM_FULL;
+        }
+        return encoded_symbols;
+    }
+    }
+    return encoded_symbols;
+}
+
+static esp_err_t ws2812_encoder_reset(rmt_encoder_t *encoder)
+{
+    ws2812_encoder_t *ws = __containerof(encoder, ws2812_encoder_t, base);
+    ws->bytes_encoder->reset(ws->bytes_encoder);
+    ws->copy_encoder->reset(ws->copy_encoder);
+    ws->state = 0;
+    return ESP_OK;
+}
+
+static esp_err_t ws2812_encoder_del(rmt_encoder_t *encoder)
+{
+    ws2812_encoder_t *ws = __containerof(encoder, ws2812_encoder_t, base);
+    rmt_del_encoder(ws->bytes_encoder);
+    rmt_del_encoder(ws->copy_encoder);
+    free(ws);
+    return ESP_OK;
+}
+
+static rmt_encoder_handle_t ws2812_encoder_handle = NULL;
+static rmt_channel_handle_t ws2812_rmt_chan = NULL;
+
+static esp_err_t ws2812_init(void)
+{
+    /* RMT TX channel */
+    rmt_tx_channel_config_t tx_cfg = {};
+    tx_cfg.gpio_num = INDICATOR_LED_PIN;
+    tx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
+    tx_cfg.resolution_hz = 10000000; /* 10 MHz → 100 ns per tick */
+    tx_cfg.mem_block_symbols = 64;
+    tx_cfg.trans_queue_depth = 4;
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &ws2812_rmt_chan));
+
+    /* Custom encoder */
+    ws2812_encoder_t *ws = (ws2812_encoder_t *)calloc(1, sizeof(ws2812_encoder_t));
+    if (!ws) return ESP_ERR_NO_MEM;
+    ws->base.encode = ws2812_encode;
+    ws->base.reset = ws2812_encoder_reset;
+    ws->base.del = ws2812_encoder_del;
+    ws->state = 0;
+    ws->reset_code = (rmt_symbol_word_t){.duration0 = WS_RST, .level0 = 0,
+                                          .duration1 = WS_RST, .level1 = 0};
+
+    rmt_bytes_encoder_config_t bytes_cfg = {};
+    bytes_cfg.bit0 = (rmt_symbol_word_t){.duration0 = WS_T0H, .level0 = 1,
+                                          .duration1 = WS_T0L, .level1 = 0};
+    bytes_cfg.bit1 = (rmt_symbol_word_t){.duration0 = WS_T1H, .level0 = 1,
+                                          .duration1 = WS_T1L, .level1 = 0};
+    bytes_cfg.flags.msb_first = 1;
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&bytes_cfg, &ws->bytes_encoder));
+
+    rmt_copy_encoder_config_t copy_cfg = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_cfg, &ws->copy_encoder));
+
+    ws2812_encoder_handle = &ws->base;
+    ESP_ERROR_CHECK(rmt_enable(ws2812_rmt_chan));
+    ESP_LOGI(TAG, "WS2812 LED initialized on GPIO %d", INDICATOR_LED_PIN);
+    return ESP_OK;
+}
+
+/* Send one pixel: r, g, b each 0-255.  WS2812 wire order is GRB. */
+static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint8_t grb[3] = { g, r, b };
+    rmt_transmit_config_t tx_config = {};
+    tx_config.loop_count = 0;
+    rmt_transmit(ws2812_rmt_chan, ws2812_encoder_handle, grb, sizeof(grb), &tx_config);
+    rmt_tx_wait_all_done(ws2812_rmt_chan, pdMS_TO_TICKS(100));
+}
+
+static void ws2812_off(void) { ws2812_set_rgb(0, 0, 0); }
+
+/* ========================== LED STATE MACHINE ============================= */
+/*
+ * LED State Priority (highest → lowest):
+ *   1. FIRE_ALERT    – 5s flashing red/orange after 5s confirmed fire
+ *   2. ARMED         – solid blue
+ *   3. GPS_STABILIZE – solid green (GPS data + STABILIZE mode)
+ *   4. GPS_OK        – dim cyan (GPS data, other mode)
+ *   5. CONNECTED     – dim white pulse (Pixhawk heartbeat)
+ *   6. IDLE          – slow magenta breathe
+ */
+
 void led_task(void *pvParameters) {
-    bool led_state = false;
+    /* Initialize WS2812 via RMT */
+    esp_err_t err = ws2812_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WS2812 init failed: %s – falling back to GPIO toggle", esp_err_to_name(err));
+        /* Fallback: simple GPIO blink */
+        gpio_set_direction(INDICATOR_LED_PIN, GPIO_MODE_OUTPUT);
+        while (1) {
+            gpio_set_level(INDICATOR_LED_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            gpio_set_level(INDICATOR_LED_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-    esp_rom_gpio_pad_select_gpio(INDICATOR_LED_PIN);
-#elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
-    gpio_pad_select_gpio(INDICATOR_LED_PIN);
-#endif
-    gpio_set_direction(INDICATOR_LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(INDICATOR_LED_PIN, LED_ACTIVE_LOW ? 1 : 0); /* OFF */
-
-    /* LED helper: respects active-high vs active-low boards */
-    #define LED_ON_LEVEL   (LED_ACTIVE_LOW ? 0 : 1)
-    #define LED_OFF_LEVEL  (LED_ACTIVE_LOW ? 1 : 0)
+    ws2812_off();
+    uint32_t tick = 0;  /* free-running counter for animations */
 
     while (1) {
-        led_state = !led_state;
+        tick++;
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* Blink fast if fire detected, slow otherwise */
-        bool fire = false;
-        if (xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(10))) {
-            fire = latest_detection.valid && latest_detection.confidence > 0.5f;
+        /* ---- Sample fire detection state ---- */
+        bool fire_now = false;
+        if (detection_mutex && xSemaphoreTake(detection_mutex, pdMS_TO_TICKS(10))) {
+            fire_now = latest_detection.valid && latest_detection.confidence > 0.5f;
             xSemaphoreGive(detection_mutex);
         }
 
-        if (fire) {
-            gpio_set_level(INDICATOR_LED_PIN, led_state ? LED_ON_LEVEL : LED_OFF_LEVEL);
-        } else if (is_connected) {
-            gpio_set_level(INDICATOR_LED_PIN, led_state ? LED_ON_LEVEL : LED_OFF_LEVEL);
+        /* ---- Fire consistency tracker (5s = 25 x 200ms) ---- */
+        if (fire_now) {
+            fire_positive_count++;
+            if (fire_positive_count >= FIRE_CONSISTENCY_CHECKS && !fire_confirmed) {
+                fire_confirmed = true;
+                fire_alert_start_ms = now_ms;
+                add_log("[LED] Fire confirmed for 5s – starting alert sequence");
+            }
         } else {
-            gpio_set_level(INDICATOR_LED_PIN, LED_OFF_LEVEL);
+            fire_positive_count = 0;
+            /* Don't cancel fire_confirmed mid-alert; let the 5s sequence finish */
         }
 
-        vTaskDelay(fire ? 200 / portTICK_PERIOD_MS : 1000 / portTICK_PERIOD_MS);
+        /* Auto-clear fire alert after FIRE_ALERT_DURATION_MS */
+        if (fire_confirmed && (now_ms - fire_alert_start_ms) > FIRE_ALERT_DURATION_MS) {
+            fire_confirmed = false;
+            fire_positive_count = 0;
+        }
+
+        /* ---- Determine LED color by priority ---- */
+        if (fire_confirmed) {
+            /* Priority 1: FIRE ALERT – alternating red / orange at ~5 Hz */
+            if (tick & 1) {
+                ws2812_set_rgb(255, 0, 0);      /* bright red */
+            } else {
+                ws2812_set_rgb(255, 80, 0);     /* orange */
+            }
+        } else if (is_armed) {
+            /* Priority 2: ARMED – solid blue */
+            ws2812_set_rgb(0, 0, 255);
+        } else if (gps_has_data && gps_fix_type >= 3 && pixhawk_custom_mode == 0) {
+            /* Priority 3: GPS + STABILIZE mode – solid green */
+            ws2812_set_rgb(0, 180, 0);
+        } else if (gps_has_data && gps_fix_type >= 3) {
+            /* Priority 4: GPS OK, other mode – dim cyan */
+            ws2812_set_rgb(0, 40, 60);
+        } else if (is_connected) {
+            /* Priority 5: Pixhawk connected – dim white pulse */
+            uint8_t br = (uint8_t)(20 + 30 * ((tick % 10 < 5) ? (tick % 5) : (4 - tick % 5)));  /* 20-170 */
+            ws2812_set_rgb(br, br, br);
+        } else {
+            /* Priority 6: IDLE – slow magenta breathe */
+            uint8_t br = (uint8_t)(5 + 15 * ((tick % 20 < 10) ? (tick % 10) : (9 - tick % 10)));  /* 5-155 */
+            ws2812_set_rgb(br, 0, br);
+        }
+
+        /* 200ms tick – matches fire consistency polling interval */
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -1726,7 +1928,7 @@ extern "C" int app_main() {
     xTaskCreatePinnedToCore(mavlink_rx_task,        "mav_rx",   4096,  NULL, 7,  NULL, 0);
     xTaskCreatePinnedToCore(mavlink_heartbeat_task, "mav_hb",   4096,  NULL, 3,  NULL, 0);
     xTaskCreatePinnedToCore(webserver_task,         "webserv",  8192,  NULL, 2,  NULL, 0);
-    xTaskCreatePinnedToCore(led_task,               "led",      2048,  NULL, 1,  NULL, 0);
+    xTaskCreatePinnedToCore(led_task,               "led",      4096,  NULL, 1,  NULL, 0);
 
     add_log("[System] 6 tasks created, scheduler running");
 
