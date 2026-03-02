@@ -90,14 +90,13 @@ static camera_config_t camera_config = {
     .frame_size = FRAMESIZE_QVGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
 
     .jpeg_quality = 12, //0-63 lower number means higher quality; 12 = good quality, small JPEG
-    .fb_count = 1,       // Single buffer + GRAB_WHEN_EMPTY: DMA only runs when we request a
-                         // frame, minimising continuous bus contention with WiFi.
+    .fb_count = 2,       // Double-buffer: camera always has one buffer to DMA into while we
+                         // hold the other.  Pump validates JPEG before caching.
     .fb_location = CAMERA_FB_IN_DRAM, // Internal SRAM for DMA target – camera DMA uses the
-                                      // internal AHB bus, WiFi DMA also uses AHB but camera
-                                      // JPEG at QQVGA is only ~2KB so transfers are very short.
-                                      // PSRAM is worse because WiFi + camera BOTH fight for
-                                      // the MSPI bus when SPIRAM is enabled.
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY, // DMA only captures when fb_get() is called.
+                                      // internal AHB bus, separate from WiFi's MSPI path.
+                                      // Two QVGA JPEG buffers ≈ 6-10 KB of DRAM.
+    .grab_mode = CAMERA_GRAB_LATEST,  // Always return the most recent completed frame;
+                                      // older unseen frames are silently recycled.
     .sccb_i2c_port = 0,
 };
 

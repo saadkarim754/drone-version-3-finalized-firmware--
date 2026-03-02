@@ -273,14 +273,26 @@ static void camera_pump_task(void *pvParameters)
 
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
-            if (consecutive_fails > 0) {
-                ESP_LOGI("cam_pump", "Camera recovered after %d failures", consecutive_fails);
+            /* Validate JPEG: must start with SOI (0xFFD8) and end with EOI (0xFFD9).
+             * WiFi AHB bus contention can corrupt camera DMA transfers, producing
+             * truncated / malformed JPEGs.  Skip them to keep the cache clean. */
+            bool valid_jpeg = (fb->len >= 4 &&
+                               fb->buf[0] == 0xFF && fb->buf[1] == 0xD8 &&
+                               fb->buf[fb->len - 2] == 0xFF && fb->buf[fb->len - 1] == 0xD9);
+            if (valid_jpeg) {
+                if (consecutive_fails > 0) {
+                    ESP_LOGI("cam_pump", "Camera recovered after %d failures", consecutive_fails);
+                }
+                consecutive_fails = 0;
+                camera_cache_frame(fb->buf, fb->len);  /* copy BEFORE returning buffer */
+                esp_camera_fb_return(fb);
+                /* Signal semaphore for any legacy code that still waits on it */
+                xSemaphoreGive(camera_ready_sem);
+            } else {
+                /* Corrupt frame – silently drop, don’t poison the cache */
+                esp_camera_fb_return(fb);
+                consecutive_fails++;
             }
-            consecutive_fails = 0;
-            camera_cache_frame(fb->buf, fb->len);
-            esp_camera_fb_return(fb);
-            /* Also signal semaphore for any legacy code that still waits on it */
-            xSemaphoreGive(camera_ready_sem);
         } else {
             consecutive_fails++;
             ESP_LOGW("cam_pump", "fb_get() returned NULL (%d consecutive)", consecutive_fails);
@@ -1708,7 +1720,7 @@ extern "C" int app_main() {
      *   even during the 620ms inference computation window.
      *   inference_task blocks on camera_ready_sem (never touches hw).
      * Core 0: Wi-Fi (prio 23) + all network/serial tasks. */
-    xTaskCreatePinnedToCore(camera_pump_task,       "cam_pump", 4096,  NULL, 15, NULL, 1);
+    xTaskCreatePinnedToCore(camera_pump_task,       "cam_pump", 16384, NULL, 15, NULL, 1);
     xTaskCreatePinnedToCore(inference_task,         "infer",    16384, NULL, 4,  NULL, 1);
     xTaskCreatePinnedToCore(serial_task,            "serial",   4096,  NULL, 5,  NULL, 0);
     xTaskCreatePinnedToCore(mavlink_rx_task,        "mav_rx",   4096,  NULL, 7,  NULL, 0);
