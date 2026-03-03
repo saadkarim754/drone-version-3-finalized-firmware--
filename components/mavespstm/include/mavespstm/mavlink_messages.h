@@ -1007,4 +1007,75 @@ static inline void mavlink_msg_global_position_int_decode(const mavlink_message_
     pos->hdg = mavlink_decode_uint16(p, 26);
 }
 
+// ============================================================================
+// REQUEST_DATA_STREAM Message Functions
+// ============================================================================
+
+/**
+ * @brief Pack a REQUEST_DATA_STREAM message (MSG ID 66)
+ *
+ * Tells the autopilot to start (or stop) sending a particular data stream.
+ * Wire order: req_message_rate(u16), target_system(u8), target_component(u8),
+ *             req_stream_id(u8), start_stop(u8)
+ * Payload length = 6, CRC extra = 148
+ *
+ * @param system_id     Sender system ID
+ * @param component_id  Sender component ID
+ * @param buf           Output buffer (>= 18 bytes)
+ * @param target_system      Target autopilot system ID
+ * @param target_component   Target autopilot component ID
+ * @param req_stream_id      MAV_DATA_STREAM enum value
+ * @param req_message_rate   Requested rate in Hz
+ * @param start_stop         1 = start, 0 = stop
+ * @return Total packet length
+ */
+static inline uint16_t mavlink_msg_request_data_stream_pack(
+    uint8_t system_id, uint8_t component_id, uint8_t *buf,
+    uint8_t target_system, uint8_t target_component,
+    uint8_t req_stream_id, uint16_t req_message_rate, uint8_t start_stop) {
+
+    uint16_t crc;
+
+    buf[0] = MAVLINK_STX_V2;   // Magic
+    buf[1] = 6;                // Payload length
+    buf[2] = 0;                // Incompat flags
+    buf[3] = 0;                // Compat flags
+    buf[4] = 0;                // Seq (filled later)
+    buf[5] = system_id;
+    buf[6] = component_id;
+    buf[7] = 66;               // Message ID low  (REQUEST_DATA_STREAM = 66)
+    buf[8] = 0;                // Message ID mid
+    buf[9] = 0;                // Message ID high
+
+    // Payload (wire order)
+    buf[10] = req_message_rate & 0xFF;
+    buf[11] = (req_message_rate >> 8) & 0xFF;
+    buf[12] = target_system;
+    buf[13] = target_component;
+    buf[14] = req_stream_id;
+    buf[15] = start_stop;
+
+    // CRC over bytes 1..15, then CRC extra 148
+    crc_init(&crc);
+    for (int i = 1; i <= 15; i++) {
+        crc_accumulate(buf[i], &crc);
+    }
+    crc_accumulate(148, &crc);  // CRC extra for REQUEST_DATA_STREAM
+
+    buf[16] = crc & 0xFF;
+    buf[17] = (crc >> 8) & 0xFF;
+
+    return 18;  // Total packet length
+}
+
+/* MAV_DATA_STREAM enum values (used with REQUEST_DATA_STREAM) */
+#define MAV_DATA_STREAM_ALL             0
+#define MAV_DATA_STREAM_RAW_SENSORS     1
+#define MAV_DATA_STREAM_EXTENDED_STATUS 2   /* SYS_STATUS, GPS_RAW_INT */
+#define MAV_DATA_STREAM_RC_CHANNELS     3
+#define MAV_DATA_STREAM_POSITION        6   /* GLOBAL_POSITION_INT */
+#define MAV_DATA_STREAM_EXTRA1          10  /* ATTITUDE */
+#define MAV_DATA_STREAM_EXTRA2          11  /* VFR_HUD */
+#define MAV_DATA_STREAM_EXTRA3          12  /* BATTERY, SCALED_PRESSURE */
+
 #endif // MAVESPSTM_MAVLINK_MESSAGES_H

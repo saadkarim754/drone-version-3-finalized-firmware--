@@ -584,6 +584,34 @@ static void send_rc_override(uint16_t ch1, uint16_t ch2, uint16_t ch3, uint16_t 
     send_mavlink_message(buf, len);
 }
 
+/* --------------------------------------------------------------------------
+ * Request telemetry data streams from Pixhawk.
+ * ArduPilot won't send GPS, attitude, battery, VFR HUD etc. unless we ask.
+ * Called once on first heartbeat and then re-requested every ~10 seconds
+ * to survive autopilot reboots.
+ * -------------------------------------------------------------------------- */
+static void request_data_streams(void) {
+    uint8_t buf[20];
+    uint16_t len;
+    struct { uint8_t stream; uint16_t rate; } streams[] = {
+        { MAV_DATA_STREAM_EXTENDED_STATUS, 2 },  /* SYS_STATUS + GPS_RAW_INT */
+        { MAV_DATA_STREAM_POSITION,        2 },  /* GLOBAL_POSITION_INT      */
+        { MAV_DATA_STREAM_EXTRA1,          4 },  /* ATTITUDE (4 Hz)          */
+        { MAV_DATA_STREAM_EXTRA2,          2 },  /* VFR_HUD                  */
+        { MAV_DATA_STREAM_EXTRA3,          1 },  /* BATTERY, SCALED_PRESSURE */
+        { MAV_DATA_STREAM_RAW_SENSORS,     1 },  /* IMU, baro raw            */
+    };
+    for (int i = 0; i < sizeof(streams)/sizeof(streams[0]); i++) {
+        len = mavlink_msg_request_data_stream_pack(
+            COMPANION_SYSID, COMPANION_COMPID, buf,
+            PIXHAWK_SYSID, PIXHAWK_COMPID,
+            streams[i].stream, streams[i].rate, 1);
+        send_mavlink_message(buf, len);
+        vTaskDelay(pdMS_TO_TICKS(20));  /* small gap so UART isn't flooded */
+    }
+    ESP_LOGI(TAG, "Requested %d data streams from Pixhawk", (int)(sizeof(streams)/sizeof(streams[0])));
+}
+
 static void send_rc_override_throttle_low(void) {
     send_rc_override(0, 0, 1000, 0);
 }
@@ -840,6 +868,16 @@ static void handle_param_value(const mavlink_message_t *msg) {
 }
 
 static void process_mavlink_message(const mavlink_message_t *msg) {
+    /* Debug: log the first time each message ID arrives (matches web-interface.c) */
+    static uint32_t msg_counts[256] = {0};
+    if (msg->msgid < 256) {
+        msg_counts[msg->msgid]++;
+        if (msg_counts[msg->msgid] == 1) {
+            ESP_LOGI(TAG, "First MSG_ID: %lu from SYS:%d COMP:%d",
+                     (unsigned long)msg->msgid, msg->sysid, msg->compid);
+        }
+    }
+
     switch (msg->msgid) {
         case MAVLINK_MSG_ID_HEARTBEAT:           handle_heartbeat(msg); break;
         case MAVLINK_MSG_ID_SYS_STATUS:          handle_sys_status(msg); break;
@@ -1176,28 +1214,37 @@ static esp_err_t root_handler(httpd_req_t *req) {
 
 /* --- JSON telemetry + detection + logs --- */
 static esp_err_t data_handler(httpd_req_t *req) {
-    char json[2560];
-    char logs_json[800] = "[";
+    char json[3072];
+    char logs_json[2048] = "[";
+    int logs_pos = 1;  /* current write position – safe, tracks actual length */
 
-    /* Build logs JSON array */
+    /* Build logs JSON array.
+     * Previous version used strcat() without bounds checking and could overflow
+     * the 800-byte buffer when log_count was large, corrupting the stack and
+     * producing malformed JSON that silently broke the browser update() poll. */
     if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         for (int i = 0; i < log_count; i++) {
             int idx = (log_head - log_count + i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
-            if (i > 0) strcat(logs_json, ",");
-            strcat(logs_json, "\"");
+
+            /* Reserve room for: ,"..." + closing ] + NUL = 6 bytes minimum */
+            if (logs_pos > (int)sizeof(logs_json) - 140) break;
+
+            if (i > 0) logs_json[logs_pos++] = ',';
+            logs_json[logs_pos++] = '"';
+
             char *p = log_entries[idx];
-            char *d = logs_json + strlen(logs_json);
-            while (*p && (d - logs_json) < 780) {
-                if (*p == '"') { *d++ = '\\'; }
-                if (*p == '\\' && *(p + 1) != '"') { *d++ = '\\'; }
-                *d++ = *p++;
+            while (*p && logs_pos < (int)sizeof(logs_json) - 10) {
+                if (*p == '"' || *p == '\\') {
+                    logs_json[logs_pos++] = '\\';
+                }
+                logs_json[logs_pos++] = *p++;
             }
-            *d = '\0';
-            strcat(logs_json, "\"");
+            logs_json[logs_pos++] = '"';
         }
         xSemaphoreGive(log_mutex);
     }
-    strcat(logs_json, "]");
+    logs_json[logs_pos++] = ']';
+    logs_json[logs_pos] = '\0';
 
     /* Get detection data */
     bool fv = false; float fc = 0; char fl[32] = "";
@@ -1821,9 +1868,18 @@ static void mavlink_rx_task(void *pvParameters) {
 /* --- MAVLink heartbeat task: send heartbeat, RC override, auto-sequence --- */
 static void mavlink_heartbeat_task(void *pvParameters) {
     ESP_LOGI(TAG, "Heartbeat task started (sysid=%d)", COMPANION_SYSID);
+    uint32_t stream_request_timer = 0;  /* re-request streams periodically */
 
     while (1) {
         send_heartbeat();
+
+        /* Request telemetry streams every 10 seconds (survives autopilot reboots)
+         * and immediately on first tick. */
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (is_connected && (now_ms - stream_request_timer > 10000 || stream_request_timer == 0)) {
+            request_data_streams();
+            stream_request_timer = now_ms;
+        }
 
         /* Safety: auto-release RC if web client disconnected */
         if (rc_override_active) {

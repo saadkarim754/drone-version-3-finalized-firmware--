@@ -1,5 +1,9 @@
 # Drone Fire Detection + Pixhawk Companion Computer
 
+<p align="center">
+  <img src="esp-companion-computer.gif" alt="Drone fire detection demo – drone view and live footage side by side" width="800">
+</p>
+
 ESP32-S3 firmware combining **Edge Impulse FOMO fire detection** with a **MAVLink Pixhawk companion computer**. A single web dashboard at `http://192.168.4.1` provides live camera feed with AI fire detection overlay, drone arm/disarm/mode controls, RC override sliders, auto-flight sequence, and full telemetry.
 
 WiFi AP: **DroneFireDetect** / **drone12345**
